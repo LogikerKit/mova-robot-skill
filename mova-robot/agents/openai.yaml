@@ -1,0 +1,4 @@
+interface:
+  display_name: "MOVA Robot"
+  short_description: "Check and control a MOVA robot from this computer"
+  default_prompt: "Use $mova-robot to check my robot's current status."

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.env*
+session.json
+devices.json
+*map*.json
+*receipt*.json
