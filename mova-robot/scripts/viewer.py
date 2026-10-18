@@ -87,6 +87,15 @@ def make_handler(manager, token, closing=None, start_gate=None):
                     if closing.is_set():return self._reply(503,{'error':'Viewer is closing.'})
                     result=manager.steer(data.get('direction'),data.get('supervised') is True)
                     return self._reply(200,result)
+                if self.path=='/steer/hold':
+                    if closing.is_set():return self._reply(503,{'error':'Viewer is closing.'})
+                    result=manager.hold(data.get('direction'),data.get('supervised') is True,data.get('hold_id'))
+                    return self._reply(200,result)
+                if self.path=='/steer/heartbeat':
+                    if closing.is_set():return self._reply(503,{'error':'Viewer is closing.'})
+                    return self._reply(200,manager.hold_heartbeat(data.get('hold_id')))
+                if self.path=='/steer/release':
+                    return self._reply(200,manager.hold_release(data.get('hold_id')))
                 return self._reply(404,{'error':'Not found.'})
             except (CameraError,SteeringError) as exc:
                 return self._reply(409,{'error':str(exc)})

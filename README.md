@@ -37,7 +37,7 @@ The login saves a refresh token, not your password, at `~/.config/mova-robot/ses
 - `mop --room ID --execute`: one ordinary low-water mopping pass, currently restricted to `mova.vacuum.r9540h`. An existing task requires `--replace-task`. Disables CleanGenius and leaves it off. Reads back settings and pauses on mode mismatch.
 - Spill-task detection using task type 15/16. **Starting dedicated spill cleaning is not implemented.** Low water is not no-added-water mode.
 - Encrypted maps and other robot models need further validation.
-- Experimental local video viewer and supervised steering for the European Z60. Existing camera PIN required; no recordings. Live video, an isolated CLI left turn, and a viewer right turn were observed on one Z60, with a steady picture after each stop. Forward movement has not been physically tested. Controls use a bounded 1.25-second hold with the native one-second command refresh; firmware automatic stopping remains unverified. [Setup, privacy and limitations](mova-robot/references/video.md). These features are local-only and are not exposed through MCP.
+- Experimental local video viewer and supervised steering for the European Z60. Existing camera PIN required; no recordings. Viewer controls are press-and-hold: release sends stop, with a five-second limit per hold and a short browser heartbeat lease. The CLI retains its bounded 1.25-second default. Live video and left/right turns with explicit stops have been observed on one Z60; forward movement and firmware automatic stopping remain unverified. [Setup, privacy and limitations](mova-robot/references/video.md). These features are local-only and are not exposed through MCP.
 
 Installing the filesystem skill or publishing this repository does not automatically install a ChatGPT connection. The MCP connection must be configured separately and the host must be running. Importing instructions alone does not provide access to your computer, token or robot.
 
@@ -47,4 +47,4 @@ Protocol subset derived from [ChuckleDucks/dreame-vacuum_z60](https://github.com
 
 Run the complete offline suite, including a real stdio MCP handshake and mocked robot operations, with `.venv/bin/python -m unittest discover -s tests`. The standalone skill tests need only `requests`: `python3 -m unittest discover -s tests -p test_mova.py`.
 
-Camera authentication, encrypted media, and worker tests use Node's built-in runner: `node --test tests/test_video_auth.mjs tests/test_video_media.mjs`. They use synthetic data and do not activate a camera or move a robot.
+Camera authentication, encrypted media, worker, and browser-control tests use Node's built-in runner: `node --test tests/test_video_auth.mjs tests/test_video_media.mjs tests/test_viewer.mjs`. They use synthetic data and mocked browser events; they do not activate a camera or move a robot.

@@ -7,9 +7,10 @@
 <div class="statusline"><span id="dot"></span><p id="status" role="status">Enter the camera PIN you already use in MOVAhome.</p><span id="countdown"></span></div>
 <section class="controls"><div><label for="pin">Camera PIN</label><div class="inputrow"><input id="pin" type="password" inputmode="numeric" autocomplete="off" maxlength="16" placeholder="Enter privately"><button id="open">Open live view</button></div>
 <p class="hint">Used for this session only. Automatically closes after 60 seconds.</p></div><button id="close" class="secondary">Close camera</button></section>
-<section class="steering"><h2>Move a little</h2><p>Each click requests a 1¼-second movement, then sends stop. Network delay can make movement last longer.</p>
+<section class="steering"><h2>Press and hold to move</h2><p>Hold a direction to move; release to stop. Each hold ends after five seconds. Network delay can delay stopping.</p>
 <label class="check"><input type="checkbox" id="supervised"> I can see the robot in person and keep its path clear.</label>
-<div class="directions"><button data-direction="left" disabled>↶ Left</button><button data-direction="forward" disabled>↑ Forward</button><button data-direction="right" disabled>Right ↷</button><button data-direction="stop" class="stop">Stop movement</button></div>
-<p class="hint" id="steerstatus">Steering requires a fresh live picture and an idle, undocked robot. Keep MOVAhome available to stop it.</p></section>
+<p class="hint" id="steerhint" role="status">Open live view above to enable movement.</p>
+<div class="directions" aria-describedby="steerhint"><button data-direction="left" disabled>↶ Left</button><button data-direction="forward" disabled>↑ Forward</button><button data-direction="right" disabled>Right ↷</button><button data-direction="stop" class="stop">Stop movement</button></div>
+<p class="hint" id="steerstatus" role="status">On a keyboard, hold Space or Enter on a direction. Keep MOVAhome available to stop the robot.</p></section>
 <footer>Uses your existing MOVA login. The PIN stays in memory. Native video encryption is required; the relay does not use TLS. This page is available only on this computer.</footer>
 </main></body></html>

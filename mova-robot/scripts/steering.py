@@ -262,6 +262,75 @@ class SteeringController:
             ) from None
         return self._result(direction, duration_ms, True)
 
+    def hold(self, direction, max_duration_ms=5000):
+        """Maintain an authorized hold until cancellation or a fixed hard cap.
+
+        The caller supplies a lease-aware cancellation event. Commands remain
+        serialized, with no retry after an unknown acknowledgement. A normal
+        release is successful once the final zero command is acknowledged.
+        """
+        if type(direction) is not str or direction not in _PRESETS:
+            raise SteeringError("Hold direction must be forward, left, or right.")
+        if type(max_duration_ms) is not int or not 100 <= max_duration_ms <= 5000:
+            raise SteeringError("Steering hold limit must be from 100 to 5000 ms.")
+        if getattr(self.robot.cloud, "_model", None) != SUPPORTED_MODEL:
+            raise SteeringError("Steering supports only model mova.vacuum.r9540h.")
+        if self.cancel_event is None:
+            raise SteeringError("Steering hold requires a cancellation lease.")
+        if not self.cancel_event.is_set():
+            self._check_readiness()
+        started = self.clock()
+        deadline = started + max_duration_ms / 1000
+        next_send = started
+        start_acknowledged = None
+        repeat_acknowledged = None
+        failed = False
+        ended_by = "cancelled"
+        try:
+            while self.clock() < deadline:
+                if self.cancel_event.is_set():
+                    break
+                now = self.clock()
+                if now < next_send:
+                    # Lease loss/release is observed within 100 ms between IO.
+                    if self._wait_until(min(next_send, deadline, now + 0.1)):
+                        break
+                    continue
+                if self.cancel_event.is_set():
+                    break
+                next_send = now + 1.0
+                if start_acknowledged is None:
+                    start_acknowledged = False
+                    announce = self._announce_next_movement
+                    self._announce_next_movement = False
+                    start_acknowledged = self._send(_PRESETS[direction], audio=announce)
+                    acknowledged = start_acknowledged
+                else:
+                    repeat_acknowledged = False
+                    repeat_acknowledged = self._send(_PRESETS[direction], audio=False)
+                    acknowledged = repeat_acknowledged
+                if not acknowledged:
+                    failed = True
+                    break
+            else:
+                ended_by = "duration"
+        except BaseException:
+            failed = True
+        finally:
+            try:
+                stop_acknowledged = self._send((0, 0), audio=False)
+            except BaseException:
+                stop_acknowledged = False
+        if not stop_acknowledged or failed:
+            message = ("Movement acknowledgement unknown. " if failed else "")
+            message += ("Stop acknowledged; verify the robot before retrying." if stop_acknowledged else
+                        "Stop acknowledgement unknown. Stop the robot in MOVAhome immediately.")
+            raise SteeringError(message, start_acknowledged=start_acknowledged,
+                                repeat_acknowledged=repeat_acknowledged,
+                                stop_acknowledged=stop_acknowledged) from None
+        return {**self._result(direction, max_duration_ms, start_acknowledged),
+                "hold": True, "ended_by": ended_by}
+
     @staticmethod
     def _result(direction, duration_ms, start_acknowledged):
         return {

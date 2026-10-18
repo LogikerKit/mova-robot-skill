@@ -128,10 +128,13 @@ class _VideoSteeringCancellation:
         manager = self.manager
         with manager.lock:
             now = time.monotonic()
+            hold = manager._active_hold
             return (manager.motion_cancel.is_set() or manager.cancel.is_set()
                 or manager.phase != 'live' or now-manager.frame_at >= 2
                 or bool(manager.deadline and now >= manager.deadline)
-                or now-manager.last_client > 15)
+                or now-manager.last_client > 15
+                or bool(hold and (hold['released'] or now >= hold['lease_until']
+                                  or now >= hold['hard_deadline'])))
 
     def wait(self, timeout):
         if self.is_set():
@@ -151,6 +154,7 @@ class CameraSession:
         self.motion_cancel = threading.Event()
         self._steering_cancel = _VideoSteeringCancellation(self)
         self.motion_generation = 0
+        self._pending_stops = 0
         self.worker = None
         self.phase = 'ready'
         self.message = 'Enter your MOVAhome camera PIN to open a 60-second live view.'
@@ -160,6 +164,10 @@ class CameraSession:
         self.camera_stop_acknowledged = None
         self.steering_disabled = False
         self._steering_controller = None
+        self._active_hold = None
+        # Never evict an ID while this viewer can receive delayed requests.
+        # A full table fails closed rather than reviving a released gesture.
+        self._hold_records = {}
         self.deadline = 0.0
 
     def status(self, touch=False):
@@ -170,6 +178,7 @@ class CameraSession:
                 'frame_age_ms':int((time.monotonic()-self.frame_at)*1000) if self.frame_at else None,
                 'remaining_seconds':max(0, int(self.deadline-time.monotonic())) if self.deadline else 0,
                 'steering_allowed':self.allow_steering and not self.steering_disabled,
+                'steering_active':self.steer_lock.locked(),
                 'camera_stop_acknowledged':self.camera_stop_acknowledged}
 
     def _state(self, phase, message):
@@ -383,16 +392,21 @@ class CameraSession:
                 generation = self.motion_generation
                 if not self.allow_steering or self.steering_disabled or supervised is not True:
                     raise CameraError('Enable supervised steering with the robot in sight first.')
+                if self._pending_stops:
+                    raise CameraError('A stop command is still finishing.')
                 if self.phase!='live' or time.monotonic()-self.frame_at>2:
                     raise CameraError('A recent live picture is required before steering.')
         if direction=='stop':
             with self.lock:
                 self.motion_generation += 1
                 self.motion_cancel.set()
+                self._pending_stops += 1
             acquired = self.steer_lock.acquire(timeout=15)
         else:
             acquired = self.steer_lock.acquire(blocking=False)
         if not acquired:
+            if direction=='stop':
+                with self.lock:self._pending_stops -= 1
             raise CameraError('Movement is still finishing. Stop the robot in MOVAhome if it is moving.')
         try:
             if direction!='stop':
@@ -420,6 +434,108 @@ class CameraSession:
             raise
         finally:
             self.steer_lock.release()
+            if direction=='stop':
+                with self.lock:self._pending_stops -= 1
+
+    @staticmethod
+    def _validate_hold_id(hold_id):
+        if not isinstance(hold_id,str) or not re.fullmatch(r'[0-9a-f]{32}',hold_id):
+            raise CameraError('Invalid steering gesture identifier.')
+
+    def _new_hold_record(self, hold_id):
+        if len(self._hold_records) >= 256:
+            raise CameraError('Gesture limit reached. Restart this private viewer before steering again.')
+        record = {'released':False,'done':threading.Event(),'result':None,'error':None}
+        self._hold_records[hold_id] = record
+        return record
+
+    def hold(self, direction, supervised=False, hold_id=None):
+        self._validate_hold_id(hold_id)
+        if direction not in ('forward','left','right') or supervised is not True:
+            raise CameraError('Hold a direction only while supervising the robot.')
+        with self.lock:
+            if hold_id in self._hold_records:
+                record = self._hold_records[hold_id]
+                if record['released'] and record['done'].is_set() and not record['error']:
+                    return record['result']
+                raise CameraError('This steering gesture has already been used.')
+            record = self._new_hold_record(hold_id)
+            try:
+                if (not self.allow_steering or self.steering_disabled or self.cancel.is_set()
+                        or self._pending_stops
+                        or self.phase!='live' or time.monotonic()-self.frame_at>=2):
+                    raise CameraError('A supervised, current live picture is required before steering.')
+                if not self.steer_lock.acquire(blocking=False):
+                    raise CameraError('Another steering command is still finishing.')
+            except CameraError as error:
+                record.update(released=True,error=str(error))
+                record['done'].set()
+                raise
+            now = time.monotonic()
+            record.update(lease_until=now+1.0,hard_deadline=now+5.0)
+            self._active_hold = record
+            self.motion_cancel.clear()
+        result = None
+        failure = None
+        try:
+            with self.access.transaction() as cloud:
+                # The lease adapter is checked after account locks and again
+                # after readiness IO, before each nonzero command.
+                with self.lock:
+                    if self._steering_controller is None:
+                        self._steering_controller = SteeringController(
+                            mova.Robot(cloud),cancel_event=self._steering_cancel)
+                    else:
+                        self._steering_controller.robot = mova.Robot(cloud)
+                    controller = self._steering_controller
+                result = controller.hold(direction,5000)
+            return result
+        except SteeringError as error:
+            if (error.start_acknowledged is False or error.repeat_acknowledged is False
+                    or error.stop_acknowledged is False):
+                self.steering_disabled = True
+            failure = str(error)
+            raise
+        except Exception:
+            failure = 'Steering request failed. Check MOVAhome; private details omitted.'
+            raise CameraError(failure) from None
+        finally:
+            with self.lock:
+                record.update(released=True,result=result,error=failure)
+                self._active_hold = None
+                self.steer_lock.release()
+                record['done'].set()
+
+    def hold_heartbeat(self, hold_id):
+        self._validate_hold_id(hold_id)
+        with self.lock:
+            record = self._hold_records.get(hold_id)
+            now = time.monotonic()
+            active = bool(record and record is self._active_hold and not record['released']
+                          and now < record['lease_until'] and now < record['hard_deadline']
+                          and not self.cancel.is_set() and not self.motion_cancel.is_set())
+            if active:
+                record['lease_until'] = min(now+1.0,record['hard_deadline'])
+            return {'accepted':active,'steering_active':active}
+
+    def hold_release(self, hold_id):
+        self._validate_hold_id(hold_id)
+        with self.lock:
+            record = self._hold_records.get(hold_id)
+            if record is None:
+                record = self._new_hold_record(hold_id)
+                record.update(released=True,result={'released':True,'stop_required':False,
+                                                     'stop_acknowledged':None})
+                record['done'].set()
+            elif record is self._active_hold:
+                record['released'] = True
+                self.motion_generation += 1
+                self.motion_cancel.set()
+        if not record['done'].wait(15):
+            raise CameraError('Steering is still stopping. Check MOVAhome if the robot is moving.')
+        if record['error']:
+            raise CameraError(record['error'])
+        return record['result']
 
     def close(self):
         self.stop()
