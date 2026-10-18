@@ -1,6 +1,6 @@
 # Experimental Z60 video and steering
 
-The local viewer is implemented and covered by offline tests. European MOVA video authentication and the existing device-to-video binding have been checked live. On 2026-10-18 the owner confirmed that a live picture appeared in the local Chrome viewer on a Z60. Physical steering/stop behavior and automatic camera shutdown have not yet been verified live. Do not describe those as proven.
+The local viewer is covered by offline tests; European MOVA video authentication and the existing device-to-video binding were checked live. On 2026-10-18 the owner confirmed a live Z60 picture in Chrome. A 250 ms left pulse received start and stop acknowledgements, but the owner reported no movement. A second 750 ms left pulse also received both acknowledgements: start round trip 121.8 ms, start-to-stop dispatch interval 750.1 ms, stop round trip 145.9 ms. Fresh frames showed unchanged fixed scene landmarks and no visible rotation; subsequent status was idle with no error. Physical movement and stopping remain unvalidated, as does automatic camera shutdown. Do not describe those as proven.
 
 ## Setup
 
