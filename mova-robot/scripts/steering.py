@@ -31,10 +31,12 @@ _PRESETS = {"forward": (200, 0), "left": (0, 45), "right": (0, -45)}
 class SteeringError(RuntimeError):
     """A sanitized outcome; acknowledgement does not prove physical stopping."""
 
-    def __init__(self, message, *, start_acknowledged=None, stop_acknowledged=None):
+    def __init__(self, message, *, start_acknowledged=None, stop_acknowledged=None,
+                 repeat_acknowledged=None):
         super().__init__(message)
         self.start_acknowledged = start_acknowledged
         self.stop_acknowledged = stop_acknowledged
+        self.repeat_acknowledged = repeat_acknowledged
 
 
 class SteeringController:
@@ -54,6 +56,9 @@ class SteeringController:
         self.timestamp = timestamp
         self.random_int = random_int
         self.cancel_event = cancel_event
+        # MOVAhome announces the first nonzero command from a mounted remote
+        # controller, then keeps audio false even after release/stop.
+        self._announce_next_movement = True
 
     def _check_readiness(self):
         try:
@@ -139,17 +144,30 @@ class SteeringController:
             and ("did" not in item or str(item["did"]) == did)
         )
 
+    def _wait_until(self, deadline):
+        """Wait only for the remaining client deadline; return cancellation."""
+        remaining = deadline - self.clock()
+        if self.cancel_event is not None:
+            if self.cancel_event.is_set():
+                return True
+            return self.cancel_event.wait(remaining) if remaining > 0 else False
+        if remaining > 0:
+            self.sleep(remaining)
+        return False
+
     def move(self, direction, duration_ms=250):
-        """Request one short pulse, always followed by one explicit stop attempt.
+        """Request a bounded hold, always followed by one explicit stop attempt.
 
         Stop bypasses readiness checks so it remains available during an error.
         Model and input validation still apply. Never automatically retry a
         movement after any failure, even when the stop was acknowledged.
+        Holds above one second may repeat once at the native one-second cadence,
+        only after the first acknowledgement and before the original deadline.
         """
         if type(direction) is not str or direction not in (*_PRESETS, "stop"):
             raise SteeringError("Direction must be forward, left, right, or stop.")
-        if type(duration_ms) is not int or not 100 <= duration_ms <= 750:
-            raise SteeringError("Steering duration must be an integer from 100 to 750 ms.")
+        if type(duration_ms) is not int or not 100 <= duration_ms <= 1250:
+            raise SteeringError("Steering duration must be an integer from 100 to 1250 ms.")
         if getattr(self.robot.cloud, "_model", None) != SUPPORTED_MODEL:
             raise SteeringError("Steering supports only model mova.vacuum.r9540h.")
 
@@ -171,20 +189,31 @@ class SteeringController:
         # must prevent a new movement after the response finally arrives.
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise SteeringError("Steering cancelled; no movement sent.")
-        deadline = self.clock() + duration_ms / 1000
+        started = self.clock()
+        deadline = started + duration_ms / 1000
+        repeat_at = started + 1.0
         start_acknowledged = False
+        repeat_acknowledged = None
         stop_acknowledged = False
         interrupted = False
         try:
-            start_acknowledged = self._send(_PRESETS[direction], audio=True)
+            announce = self._announce_next_movement
+            # Consume before transport: a lost acknowledgement must not cause
+            # another announcement on a subsequent authorized pulse.
+            self._announce_next_movement = False
+            start_acknowledged = self._send(_PRESETS[direction], audio=announce)
             if start_acknowledged:
-                remaining = deadline - self.clock()
-                if self.cancel_event is not None:
-                    interrupted = self.cancel_event.is_set()
-                    if remaining > 0 and not interrupted:
-                        interrupted = self.cancel_event.wait(remaining)
-                elif remaining > 0:
-                    self.sleep(remaining)
+                interrupted = self._wait_until(min(deadline, repeat_at))
+                if duration_ms > 1000 and not interrupted and self.clock() < deadline:
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        interrupted = True
+                    else:
+                        # At most one scheduled continuation, never a retry of
+                        # an unconfirmed command. Latency consumes this hold.
+                        repeat_acknowledged = False
+                        repeat_acknowledged = self._send(_PRESETS[direction], audio=False)
+                        if repeat_acknowledged:
+                            interrupted = self._wait_until(deadline)
         except BaseException:
             interrupted = True
         finally:
@@ -198,7 +227,9 @@ class SteeringController:
 
         if not stop_acknowledged:
             start = (
-                "Movement acknowledged, but stop acknowledgement unknown. "
+                "Repeated movement acknowledgement unknown; stop acknowledgement also unknown. "
+                if repeat_acknowledged is False
+                else "Movement acknowledged, but stop acknowledgement unknown. "
                 if start_acknowledged
                 else "Movement acknowledgement unknown; stop acknowledgement also unknown. "
             )
@@ -207,6 +238,15 @@ class SteeringController:
                 "Do not retry movement.",
                 start_acknowledged=start_acknowledged,
                 stop_acknowledged=False,
+                repeat_acknowledged=repeat_acknowledged,
+            ) from None
+        if repeat_acknowledged is False:
+            raise SteeringError(
+                "Repeated movement acknowledgement unknown. Stop acknowledged; "
+                "verify the robot in MOVAhome before any retry.",
+                start_acknowledged=start_acknowledged,
+                stop_acknowledged=True,
+                repeat_acknowledged=False,
             ) from None
         if not start_acknowledged or interrupted:
             start = (
@@ -218,6 +258,7 @@ class SteeringController:
                 start + "Stop acknowledged; verify the robot in MOVAhome before any retry.",
                 start_acknowledged=start_acknowledged,
                 stop_acknowledged=True,
+                repeat_acknowledged=repeat_acknowledged,
             ) from None
         return self._result(direction, duration_ms, True)
 

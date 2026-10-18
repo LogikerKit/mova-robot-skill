@@ -33,7 +33,7 @@ class SteeringCliTests(unittest.TestCase):
             ["steer", "--execute", "--direction", "stop"],
         ]
         prefix = ["steer", "--execute", "--experimental-steering", "--direction", "forward"]
-        cases += [prefix + ["--duration-ms", value] for value in ("99", "751", "250.0", "true")]
+        cases += [prefix + ["--duration-ms", value] for value in ("99", "1251", "250.0", "true")]
         for args in cases:
             with self.subTest(arguments=args), patch.object(sys, "argv", ["mova.py", *args]), \
                     patch.object(sys, "stderr", io.StringIO()), \
@@ -95,6 +95,15 @@ class SteeringCliTests(unittest.TestCase):
         cloud._session.close.assert_called_once_with()
         self.assertEqual(self.signals.call_count, 2)
         self.assertEqual(self.signals.call_args.args, (signal.SIGTERM, self.previous_signal))
+
+    def test_native_hold_limit_is_accepted_and_default_uses_bounded_1250ms(self):
+        cloud = self.fake_cloud()
+        move = Mock(return_value={"stop_acknowledged": True})
+        self.invoke(cloud, move, ["--duration-ms", "1250"])
+        move.assert_called_once_with("left", 1250)
+        move.reset_mock()
+        self.invoke(cloud, move)
+        move.assert_called_once_with("left", 1250)
 
     def test_ambiguous_or_unowned_device_never_constructs_controller(self):
         records = [{"did": str(number), "model": "mova.vacuum.r9540h", "uid": "fake-owner"} for number in (123, 456)]

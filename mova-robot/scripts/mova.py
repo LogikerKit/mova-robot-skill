@@ -8,7 +8,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
+import secrets
 import signal
+import stat
 import struct
 import sys
 import tempfile
@@ -34,6 +37,42 @@ def save_session(data):
         os.replace(path, CONFIG / 'session.json')
     finally:
         if os.path.exists(path): os.unlink(path)
+
+
+def load_client_id():
+    """Load/create the SDK-style installation ID while holding session.lock.
+
+    This is independent of login secrets and persists across CLI/viewer runs.
+    Never replace an invalid existing ID: changing it could change the robot's
+    interpretation of commands belonging to an existing remote-control client.
+    """
+    target = CONFIG / 'client-id'
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        client_id = 'A' + secrets.token_hex(3)
+        fd, temporary = tempfile.mkstemp(prefix='.client-id-', dir=CONFIG)
+        try:
+            with os.fdopen(fd, 'w', encoding='ascii') as out:
+                os.fchmod(out.fileno(), 0o600)
+                out.write(client_id + '\n')
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary): os.unlink(temporary)
+        return client_id
+    except OSError:
+        raise RuntimeError('MOVA client identifier could not be read safely.') from None
+    with os.fdopen(fd, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError('MOVA client identifier must be an owner-only regular file (mode 0600).')
+        value = source.read(9)
+    if re.fullmatch(rb'A[0-9a-f]{6}\n?', value) is None:
+        raise RuntimeError('MOVA client identifier is invalid; existing file was preserved.')
+    return value.rstrip(b'\n').decode('ascii')
 
 
 def summarize(raw):
@@ -154,7 +193,7 @@ def main():
     parser.add_argument('--execute',action='store_true',help='User has authorized this robot action')
     parser.add_argument('--replace-task',action='store_true')
     parser.add_argument('--direction',choices=['forward','left','right','stop'])
-    parser.add_argument('--duration-ms',type=int,default=250,help='Requested steering pulse, 100–750 ms; cloud latency can prolong movement')
+    parser.add_argument('--duration-ms',type=int,default=1250,help='Requested steering hold, 100–1250 ms; above 1000 ms allows one native-cadence repeat; cloud latency can prolong movement')
     parser.add_argument('--experimental-steering',action='store_true',help='Enable supervised steering; firmware automatic-stop behaviour is unverified')
     args=parser.parse_args()
     if args.command in {'pause','stop','mop','steer'} and not args.execute:
@@ -163,8 +202,8 @@ def main():
     if args.command=='steer':
         if not args.experimental_steering or args.direction is None:
             parser.error('steer requires --experimental-steering and --direction for supervised operation')
-        if not 100 <= args.duration_ms <= 750:
-            parser.error('Requested steering duration must be 100–750 ms')
+        if not 100 <= args.duration_ms <= 1250:
+            parser.error('Requested steering duration must be 100–1250 ms')
     logging.disable(logging.CRITICAL) # Upstream logs can contain auth responses.
     CONFIG.mkdir(parents=True,exist_ok=True,mode=0o700)
     with (CONFIG/'session.lock').open('a') as lock:
@@ -172,17 +211,18 @@ def main():
         cloud=None
         saved_refresh=None
         try:
+            client_id=load_client_id()
             if args.command=='login':
                 region=input('MOVAhome region [eu]: ').strip() or 'eu'
                 if region not in {'eu','cn','us','ru','sg'}: raise RuntimeError('Unsupported region')
                 user=input('MOVAhome email/phone: ').strip()
                 password=getpass.getpass('MOVAhome password: ')
-                cloud=DreameVacuumDreameHomeCloudProtocol(user,password,'mova',region)
+                cloud=DreameVacuumDreameHomeCloudProtocol(user,password,'mova',region,client_id=client_id)
             else:
                 session=json.loads((CONFIG/'session.json').read_text())
                 region=session['region']
                 if region not in {'eu','cn','us','ru','sg'}: raise RuntimeError('Invalid session region')
-                cloud=DreameVacuumDreameHomeCloudProtocol(None,None,'mova',region,auth_key=session['refresh_token'])
+                cloud=DreameVacuumDreameHomeCloudProtocol(None,None,'mova',region,auth_key=session['refresh_token'],client_id=client_id)
             if not cloud.login(): raise RuntimeError('Login failed; sign in privately using login')
             save_session({'region':region,'refresh_token':cloud._secondary_key})
             saved_refresh=cloud._secondary_key

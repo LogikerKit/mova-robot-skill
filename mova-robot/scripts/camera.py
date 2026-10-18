@@ -60,7 +60,7 @@ class CloudAccess:
                 if c:
                     c._session.close()
                 c = mova.DreameVacuumDreameHomeCloudProtocol(None, None, 'mova', region,
-                    auth_key=saved['refresh_token'])
+                    auth_key=saved['refresh_token'], client_id=mova.load_client_id())
                 self.cloud = c
             try:
                 if not c._logged_in or not c._key_expire or c._key_expire <= time.time():
@@ -119,6 +119,28 @@ def verify_pin(cloud, session, pin):
         raise CameraError(message)
 
 
+class _VideoSteeringCancellation:
+    """Combine explicit Stop with video freshness at each steering checkpoint."""
+    def __init__(self, manager):
+        self.manager = manager
+
+    def is_set(self):
+        manager = self.manager
+        with manager.lock:
+            now = time.monotonic()
+            return (manager.motion_cancel.is_set() or manager.cancel.is_set()
+                or manager.phase != 'live' or now-manager.frame_at >= 2
+                or bool(manager.deadline and now >= manager.deadline)
+                or now-manager.last_client > 15)
+
+    def wait(self, timeout):
+        if self.is_set():
+            return True
+        # Preserve the requested cadence. Recheck the image/session after the
+        # wait, before SteeringController may issue its one scheduled repeat.
+        return self.manager.motion_cancel.wait(timeout) or self.is_set()
+
+
 class CameraSession:
     def __init__(self, access, allow_steering=False):
         self.access = access
@@ -127,6 +149,7 @@ class CameraSession:
         self.steer_lock = threading.Lock()
         self.cancel = threading.Event()
         self.motion_cancel = threading.Event()
+        self._steering_cancel = _VideoSteeringCancellation(self)
         self.motion_generation = 0
         self.worker = None
         self.phase = 'ready'
@@ -136,6 +159,7 @@ class CameraSession:
         self.last_client = time.monotonic()
         self.camera_stop_acknowledged = None
         self.steering_disabled = False
+        self._steering_controller = None
         self.deadline = 0.0
 
     def status(self, touch=False):
@@ -165,6 +189,7 @@ class CameraSession:
             self.camera_stop_acknowledged = None
             self.last_client = time.monotonic()
             self.deadline = 0.0
+            self._steering_controller = None
             self._state('starting','Signing in to the video service…')
             self.worker = threading.Thread(target=self._run,args=(pin,),daemon=False)
             self.worker.start()
@@ -379,7 +404,17 @@ class CameraSession:
                 # Repeat the cancellation/frame check after waiting for cloud IO.
                 if direction!='stop' and (self.cancel.is_set() or time.monotonic()-self.frame_at>2):
                     raise CameraError('Live view is no longer current; no movement sent.')
-                return SteeringController(mova.Robot(c),cancel_event=self.motion_cancel).move(direction,250)
+                # Preserve MOVAhome's one-time announcement across pulses in
+                # this camera session. Account refresh may replace the cloud
+                # client, so refresh the robot reference for every transaction.
+                with self.lock:
+                    if self._steering_controller is None:
+                        self._steering_controller = SteeringController(
+                            mova.Robot(c),cancel_event=self._steering_cancel)
+                    else:
+                        self._steering_controller.robot = mova.Robot(c)
+                    controller = self._steering_controller
+                return controller.move(direction,250 if direction=='stop' else 1250)
         except SteeringError:
             self.steering_disabled = True
             raise

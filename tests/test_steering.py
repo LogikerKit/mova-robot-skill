@@ -64,7 +64,7 @@ class SteeringTests(unittest.TestCase):
 
     def test_invalid_direction_or_duration_is_rejected_before_read(self):
         cases = [(direction, 250) for direction in ("backward", "turnAround", "", None, True, 1)]
-        cases += [("forward", duration) for duration in (True, False, "250", 250.0, None, -1, 0, 99, 751)]
+        cases += [("forward", duration) for duration in (True, False, "250", 250.0, None, -1, 0, 99, 1251)]
         cases += [("stop", 99), ("stop", True)]
         for direction, duration in cases:
             with self.subTest(direction=direction, duration=duration), self.assertRaises(SteeringError):
@@ -207,6 +207,30 @@ class SteeringTests(unittest.TestCase):
         self.robot.read.assert_not_called()
         self.assertEqual([(p["spdv"], p["spdw"]) for p in self.packets()], [(0, 0)])
 
+    def test_announcement_occurs_only_on_first_movement_even_after_explicit_stop(self):
+        self.controller.move("stop")
+        self.controller.move("forward")
+        self.controller.move("stop")
+        self.controller.move("left")
+        self.assertEqual([p["audio"] for p in self.packets()],
+                         ["false", "true", "false", "false", "false", "false"])
+
+    def test_failed_readiness_does_not_consume_first_announcement(self):
+        self.robot.read.return_value = {**READY, "child_lock": 1}
+        with self.assertRaises(SteeringError):
+            self.controller.move("left")
+        self.assert_no_commands()
+        self.robot.read.return_value = dict(READY)
+        self.controller.move("left")
+        self.assertEqual([p["audio"] for p in self.packets()], ["true", "false"])
+
+    def test_unknown_start_ack_does_not_repeat_announcement_on_next_authorized_pulse(self):
+        self.cloud.send.side_effect = [None, [{"code": 0}], [{"code": 0}], [{"code": 0}]]
+        with self.assertRaises(SteeringError):
+            self.controller.move("forward")
+        self.controller.move("left")
+        self.assertEqual([p["audio"] for p in self.packets()], ["true", "false", "false", "false"])
+
     def test_normal_move_is_one_start_then_stop_with_precise_acknowledgements(self):
         result = self.controller.move("forward", 250)
         packets = self.packets()
@@ -246,6 +270,103 @@ class SteeringTests(unittest.TestCase):
         self.assertEqual(len(self.clock.sleeps), 1)
         self.assertAlmostEqual(self.clock.sleeps[0], 0.05)
         self.assertEqual(self.cloud.send.call_count, 2)
+
+    def test_1250ms_hold_repeats_once_at_one_second_and_stops_at_fixed_deadline(self):
+        times = []
+        def acknowledge(*args):
+            times.append(self.clock.now)
+            return [{"code": 0}]
+        self.cloud.send.side_effect = acknowledge
+        result = self.controller.move("left", 1250)
+        self.assertEqual(times, [10.0, 11.0, 11.25])
+        self.assertEqual(self.clock.sleeps, [1.0, 0.25])
+        self.assertEqual([(p["spdv"], p["spdw"], p["audio"]) for p in self.packets()],
+                         [(0, 45, "true"), (0, 45, "false"), (0, 0, "false")])
+        self.assertEqual(result["requested_duration_ms"], 1250)
+        self.assertTrue(result["stop_acknowledged"])
+
+    def test_one_second_boundary_has_no_repeat(self):
+        self.controller.move("left", 1000)
+        self.assertEqual(self.clock.sleeps, [1.0])
+        self.assertEqual([(p["spdv"], p["spdw"]) for p in self.packets()], [(0, 45), (0, 0)])
+
+    def test_slow_first_ack_waits_for_ack_but_does_not_extend_deadline(self):
+        times = []
+        def acknowledge(*args):
+            times.append(self.clock.now)
+            if len(times) == 1:
+                self.clock.now += 1.1
+            return [{"code": 0}]
+        self.cloud.send.side_effect = acknowledge
+        self.controller.move("left", 1250)
+        self.assertEqual(times, [10.0, 11.1, 11.25])
+        self.assertEqual(len(self.clock.sleeps), 1)
+        self.assertAlmostEqual(self.clock.sleeps[0], 0.15)
+
+    def test_first_ack_after_hold_deadline_does_not_repeat(self):
+        def acknowledge(*args):
+            if self.cloud.send.call_count == 1:
+                self.clock.now += 1.3
+            return [{"code": 0}]
+        self.cloud.send.side_effect = acknowledge
+        self.controller.move("left", 1250)
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(len(self.packets()), 2)
+        self.assertEqual(self.packets()[-1]["spdw"], 0)
+
+    def test_slow_repeat_ack_stops_immediately_without_extending_hold(self):
+        times = []
+        def acknowledge(*args):
+            times.append(self.clock.now)
+            if len(times) == 2:
+                self.clock.now += 0.4
+            return [{"code": 0}]
+        self.cloud.send.side_effect = acknowledge
+        self.controller.move("left", 1250)
+        self.assertEqual(times, [10.0, 11.0, 11.4])
+        self.assertEqual(self.clock.sleeps, [1.0])
+        self.assertEqual(len(self.packets()), 3)
+
+    def test_cancel_before_repeat_sends_no_additional_movement(self):
+        cancel = Mock()
+        cancel.is_set.return_value = False
+        def cancel_wait(seconds):
+            self.clock.now += seconds
+            return True
+        cancel.wait.side_effect = cancel_wait
+        self.controller.cancel_event = cancel
+        with self.assertRaises(SteeringError) as raised:
+            self.controller.move("left", 1250)
+        cancel.wait.assert_called_once_with(1.0)
+        self.assertEqual([(p["spdv"], p["spdw"]) for p in self.packets()], [(0, 45), (0, 0)])
+        self.assertIsNone(raised.exception.repeat_acknowledged)
+        self.assertTrue(raised.exception.stop_acknowledged)
+
+    def test_lost_or_failed_repeat_ack_stops_once_and_reports_uncertainty(self):
+        for response in (None, [{"code": 1}], TimeoutError("FAKE-PRIVATE"), KeyboardInterrupt()):
+            with self.subTest(response=type(response).__name__):
+                self.cloud.send.reset_mock()
+                self.clock.now = 10.0
+                self.clock.sleeps.clear()
+                self.cloud.send.side_effect = [[{"code": 0}], response, [{"code": 0}]]
+                with self.assertRaisesRegex(SteeringError, "Repeated movement acknowledgement unknown") as raised:
+                    self.controller.move("left", 1250)
+                self.assertTrue(raised.exception.start_acknowledged)
+                self.assertFalse(raised.exception.repeat_acknowledged)
+                self.assertTrue(raised.exception.stop_acknowledged)
+                self.assertEqual(self.clock.sleeps, [1.0])
+                self.assertEqual([(p["spdv"], p["spdw"]) for p in self.packets()],
+                                 [(0, 45), (0, 45), (0, 0)])
+                self.assertNotIn("FAKE-PRIVATE", str(raised.exception))
+
+    def test_long_hold_never_repeats_an_unknown_first_ack(self):
+        self.cloud.send.side_effect = [None, [{"code": 0}]]
+        with self.assertRaises(SteeringError) as raised:
+            self.controller.move("left", 1250)
+        self.assertFalse(raised.exception.start_acknowledged)
+        self.assertIsNone(raised.exception.repeat_acknowledged)
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(len(self.packets()), 2)
 
     def test_late_start_acknowledgement_stops_without_extra_sleep(self):
         def reply(*args):

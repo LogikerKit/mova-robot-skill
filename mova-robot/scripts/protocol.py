@@ -1,13 +1,18 @@
 # Derived from ChuckleDucks/dreame-vacuum_z60; see LICENSE.
 from __future__ import annotations
-import logging, random, hashlib, json, base64, zlib, queue, time
+import logging, random, hashlib, json, base64, zlib, queue, time, re, secrets
 import requests
 from typing import Final, Any
 _LOGGER = logging.getLogger(__name__)
 DREAME_STRINGS: Final = 'H4sICAAAAAAEAGNsb3VkX3N0cmluZ3MuanNvbgCFU9tuGjEQ/RUUKaiVysIuiKWKeKAgBK2qbbikIVWFBtvLuvFla5sQ+vUd26Q0fek+2HPmPsc7364Srl1CDQPJEsdIdfXuKu1m/RzvxegkNuPrUi4/1fn16ieqJsFxu5RgXKUla2dJmrxvvOFfKq3YTYMXy0Y6SHpJetNYEhCs3U06nbc+KRl0dt18kO+yrN/P8/6OUNIbpGU3p4MSetkO0g50O1AOUujTspVi0AewnDQeZh/F5msq7rPpkcw2z8Xj9PZeLrLbWT1ap9OHO1UVxWQ/xIBO+FCwDtzBoiDBOmbWnKK844pOtASuENRG18y4E4pIwZx6lQBXaiOH82LZtATtQxCiuTeg3NadEKKTYaVhtto6/chU8xXy5hqsPWpDmwfLjAIZYpov2gBCJiBEH5RD3I7st+DgqrYOZ8iGJnRi1sbkl9J/MHuuOSq2PBr3XHvBMeX7DROfU/teWjhlnNUjT0VEkamLhYIDH8meOGEoCG7dXebtqtTRUKzG8wi0I14KcxuQ9uwf8N5HS02ZCN0RHN9eWsJqLaKlfyqm6FhLCS8dlVz4UH95As9v5WM9c3hVWEIb/3J75iah0Uns2v6DJ7HYCElFtPY0jPZMuYtpIQgC76AN/wUucrgKHLbCXzHWyjEEq1gc6lpwEhzbP2zwrrd4bM/t6KMSGujaiKgorE3pK23cOamfoOU3Lok0fEb812KlSZb0/r9Y338DqLVvecIDAAA='
 class DreameVacuumDreameHomeCloudProtocol:
 
-    def __init__(self, username: str, password: str, account_type: str='dreame', country: str='cn', auth_key: str=None, did: str=None) -> None:
+    def __init__(self, username: str, password: str, account_type: str='dreame', country: str='cn', auth_key: str=None, did: str=None, client_id: str=None) -> None:
+        if client_id is None:
+            client_id = 'A' + secrets.token_hex(3)
+        if type(client_id) is not str or re.fullmatch(r'A[0-9a-f]{6}', client_id) is None:
+            raise ValueError('Invalid MOVA client identifier.')
+        self._client_id = client_id
         self._username = username
         self._password = password
         self._account_type = account_type
@@ -18,7 +23,7 @@ class DreameVacuumDreameHomeCloudProtocol:
         self._thread = None
         self._client_queue = queue.Queue()
         self._client_thread = None
-        self._id = random.randint(1, 100)
+        self._id = random.randint(101, 10100)
         self._reconnect_timer = None
         self._host = None
         self._model = None
@@ -154,13 +159,31 @@ class DreameVacuumDreameHomeCloudProtocol:
         host = ''
         if self._host and len(self._host):
             host = f"-{self._host.split('.')[0]}"
-        api_response = self._api_call(f'{self._strings[37]}{host}/{self._strings[27]}/{self._strings[38]}', {'did': str(self._did), 'id': self._id, 'data': {'did': str(self._did), 'id': self._id, 'method': method, 'params': parameters}}, retry_count)
-        self._id = self._id + 1
-        if api_response is None or 'data' not in api_response or api_response['data'] is None or ('result' not in api_response['data']):
-            if api_response:
-                _LOGGER.error('Failed to execute api call: %s', api_response)
+        # The MOVA SDK increments before sending and reuses one installation
+        # identifier across commands, including a motion pulse and its stop.
+        self._id += 1
+        request_id = self._id
+        api_response = self._api_call(
+            f'{self._strings[37]}{host}/{self._strings[27]}/{self._strings[38]}',
+            {'did': str(self._did), 'id': request_id,
+             'data': {'did': str(self._did), 'id': request_id, 'method': method,
+                      'from': self._client_id, 'params': parameters}}, retry_count)
+        if (not isinstance(api_response, dict)
+                or type(api_response.get('code')) is not int
+                or api_response['code'] != 0
+                or ('success' in api_response and api_response['success'] is not True)
+                or 'error' in api_response):
             return None
-        return api_response['data']['result']
+        data = api_response.get('data')
+        if not isinstance(data, dict) or 'result' not in data or 'error' in data:
+            return None
+        if ('code' in data and (type(data['code']) is not int or data['code'] != 0)
+                or 'success' in data and data['success'] is not True):
+            return None
+        for envelope in (api_response, data):
+            if 'id' in envelope and (type(envelope['id']) is not int or envelope['id'] != request_id):
+                return None
+        return data['result']
 
     def get_file(self, url: str, retry_count: int=4) -> Any:
         retries = 0

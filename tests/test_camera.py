@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mova-robot/scripts"))
 import camera
 import mova
-from steering import SteeringError
+from steering import SteeringController, SteeringError
 
 
 class FakeAccess:
@@ -348,7 +348,7 @@ class CameraTests(unittest.TestCase):
             expected = {"stop_acknowledged": True}
             controller.return_value.move.return_value = expected
             self.assertEqual(self.session.steer("stop"), expected)
-            controller.assert_called_once_with(robot.return_value, cancel_event=self.session.motion_cancel)
+            controller.assert_called_once_with(robot.return_value, cancel_event=self.session._steering_cancel)
             controller.return_value.move.assert_called_once_with("stop", 250)
             self.session.allow_steering = True
             self.session.steering_disabled = False
@@ -419,6 +419,117 @@ class CameraTests(unittest.TestCase):
         self.cloud.send.assert_not_called()
         self.assertTrue(self.session.cancel.is_set())
         self.assertTrue(self.session.motion_cancel.is_set())
+
+    def test_announcement_persists_across_pulses_and_resets_for_fresh_camera_session(self):
+        self.ready_for_steering()
+        self.read_video.return_value = {
+            "state": 2, "error": 0, "battery_percent": 60, "charging": 2,
+            "activity": 0, "task_status": 0, "wash_station": 0, "child_lock": 0,
+            "dust_status": 0, "water_draining": 0, "lds_state": 1,
+        }
+        self.cloud.send.return_value = [{"code": 0}]
+        with patch.object(self.session.motion_cancel, "wait", return_value=False):
+            self.session.steer("left", True)
+            self.session.steer("right", True)
+            with patch.object(camera.threading, "Thread") as thread:
+                self.session.start("1234")
+                thread.return_value.start.assert_called_once_with()
+            self.ready_for_steering()
+            self.session.steer("left", True)
+        payloads = [json.loads(call.args[1][0]["value"]) for call in self.cloud.send.call_args_list]
+        self.assertEqual([p["audio"] for p in payloads],
+                         ["true", "false", "false", "false", "false", "false", "true", "false", "false"])
+
+    def test_persistent_controller_refreshes_robot_after_cloud_client_replacement(self):
+        self.ready_for_steering()
+        second_cloud = Mock()
+        first_robot, second_robot = Mock(), Mock()
+        with patch.object(camera, "SteeringController") as controller, \
+                patch.object(mova, "Robot", side_effect=[first_robot, second_robot]) as robot:
+            self.session.steer("left", True)
+            self.access.cloud = second_cloud
+            self.session.steer("right", True)
+        controller.assert_called_once_with(first_robot, cancel_event=self.session._steering_cancel)
+        self.assertIs(controller.return_value.robot, second_robot)
+        self.assertEqual(robot.call_args_list[0].args, (self.cloud,))
+        self.assertEqual(robot.call_args_list[1].args, (second_cloud,))
+        self.assertEqual([call.args for call in controller.return_value.move.call_args_list],
+                         [("left", 1250), ("right", 1250)])
+
+    def run_video_hold(self, interruption=None):
+        now = [10.0]
+        self.session.phase = "live"
+        self.session.frame_at = now[0]
+        self.session.last_client = now[0]
+        self.session.deadline = 70.0
+        self.read_video.return_value = {
+            "state": 2, "error": 0, "battery_percent": 60, "charging": 2,
+            "activity": 0, "task_status": 0, "wash_station": 0, "child_lock": 0,
+            "dust_status": 0, "water_draining": 0, "lds_state": 1,
+        }
+        dispatches = []
+        def send(method, params, retry_count):
+            dispatches.append((now[0], json.loads(params[0]["value"]), retry_count))
+            return [{"code": 0}]
+        self.cloud.send.side_effect = send
+        waits = []
+        def wait(duration):
+            waits.append(duration)
+            now[0] += duration
+            if interruption == "stale":
+                self.session.frame_at = now[0] - 2.01
+            elif interruption == "closed":
+                self.session.phase = "closed"
+            elif interruption == "deadline":
+                self.session.deadline = now[0]
+            elif interruption == "cancel":
+                self.session.stop()
+            else:
+                self.session.frame_at = now[0]
+            return self.session.motion_cancel.is_set()
+        def controller(robot, **kwargs):
+            return SteeringController(robot, clock=lambda: now[0], **kwargs)
+        with patch.object(camera.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(self.session.motion_cancel, "wait", side_effect=wait), \
+                patch.object(camera, "SteeringController", side_effect=controller):
+            if interruption:
+                with self.assertRaises(SteeringError) as error:
+                    self.session.steer("left", True)
+                self.assertTrue(error.exception.stop_acknowledged)
+                self.assertIsNone(error.exception.repeat_acknowledged)
+                result = None
+            else:
+                result = self.session.steer("left", True)
+        self.assertTrue(all(retries == 0 for _, _, retries in dispatches))
+        return result, dispatches, waits
+
+    def test_viewer_uses_1250ms_hold_with_one_repeat_and_fresh_video(self):
+        result, dispatches, waits = self.run_video_hold()
+        self.assertEqual(result["requested_duration_ms"], 1250)
+        self.assertEqual([at for at, _, _ in dispatches], [10.0, 11.0, 11.25])
+        self.assertEqual([p["spdw"] for _, p, _ in dispatches], [45, 45, 0])
+        self.assertEqual([p["audio"] for _, p, _ in dispatches], ["true", "false", "false"])
+        self.assertEqual(waits, [1.0, 0.25])
+
+    def test_stale_video_before_repeat_sends_stop_without_second_movement(self):
+        _, dispatches, waits = self.run_video_hold("stale")
+        self.assertEqual([p["spdw"] for _, p, _ in dispatches], [45, 0])
+        self.assertEqual(waits, [1.0])
+
+    def test_camera_phase_end_before_repeat_sends_only_stop(self):
+        _, dispatches, waits = self.run_video_hold("closed")
+        self.assertEqual([p["spdw"] for _, p, _ in dispatches], [45, 0])
+        self.assertEqual(waits, [1.0])
+
+    def test_camera_deadline_before_repeat_sends_only_stop(self):
+        _, dispatches, waits = self.run_video_hold("deadline")
+        self.assertEqual([p["spdw"] for _, p, _ in dispatches], [45, 0])
+        self.assertEqual(waits, [1.0])
+
+    def test_camera_cancel_before_repeat_sends_only_stop(self):
+        _, dispatches, waits = self.run_video_hold("cancel")
+        self.assertEqual([p["spdw"] for _, p, _ in dispatches], [45, 0])
+        self.assertEqual(waits, [1.0])
 
     def test_unknown_steering_ack_disables_future_movement_and_releases_lock(self):
         self.ready_for_steering()
