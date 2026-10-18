@@ -97,16 +97,22 @@ function stopInput(hold){
 function releaseHold(message='Releasing — waiting for stop confirmation…',send=true){
   const hold=activeHold;
   if(!hold||!hold.held)return hold?.releasePromise;
+  hold.releasedAt=performance.now();
   stopInput(hold);
   if(hold.generation===steeringGeneration)$('steerstatus').textContent=message;
   if(send&&token){
     hold.releasePromise=call('/steer/release',{hold_id:hold.id},{keepalive:true})
-      .then(result=>{hold.releaseResult=result;return result;})
+      .then(result=>{hold.releaseResult=result;recordStopReply(hold,result);return result;})
       .catch(error=>{hold.releaseError=error;return null;});
   }
   return hold.releasePromise;
 }
 function safeRelease(result){return result?.stop_acknowledged===true||result?.stop_required===false;}
+function recordStopReply(hold,result){
+  if(result.stop_acknowledged===true&&Number.isFinite(hold.releasedAt)&&hold.ackElapsedMs===undefined){
+    hold.ackElapsedMs=Math.max(0,performance.now()-hold.releasedAt);
+  }
+}
 async function heartbeat(hold){
   if(activeHold!==hold||!hold.held||hold.heartbeatBusy)return;
   if(prerequisite()){releaseHold('Live view is no longer ready. Waiting for stop confirmation…');return;}
@@ -127,6 +133,7 @@ async function runHold(hold){
   let message='',fault=false;
   try{
     const result=await call('/steer/hold',{direction:hold.direction,supervised:true,hold_id:hold.id});
+    recordStopReply(hold,result);
     stopInput(hold);
     if(result.stop_acknowledged===true)message='Stop acknowledged. Confirm the robot has stopped.';
     else if(result.stop_required===false)message='Movement cancelled before it started.';
@@ -147,6 +154,11 @@ async function runHold(hold){
     if(hold.generation===steeringGeneration){
       if(fault)$('supervised').checked=false;
       $('steerstatus').textContent=message;
+      if(!fault&&Number.isFinite(hold.ackElapsedMs)){
+        const elapsed=Math.round(hold.ackElapsedMs);
+        $('steertiming').textContent=`Stop reply: ${elapsed} ms after control release. This measures communication, not physical stopping.`;
+        $('steertiming').setAttribute('data-stop-reply-ms',String(hold.ackElapsedMs));
+      }
     }
     refreshButtons();
   }
@@ -156,6 +168,7 @@ function startHold(button,input){
   const hold={id:holdId(),direction:button.dataset.direction,button,held:true,
     generation:++steeringGeneration,...input};
   activeHold=hold;
+  $('steertiming').textContent='';$('steertiming').removeAttribute('data-stop-reply-ms');
   if(hold.pointerId!==undefined){
     try{button.setPointerCapture(hold.pointerId);}catch{
       activeHold=null;
@@ -200,6 +213,7 @@ $('reconnect').onclick=()=>{
 document.querySelector('[data-direction="stop"]').onclick=async()=>{
   if(stopBusy||!token)return;
   releaseHold();stopBusy=true;const generation=++steeringGeneration;
+  $('steertiming').textContent='';$('steertiming').removeAttribute('data-stop-reply-ms');
   $('steerstatus').textContent='Sending stop…';refreshButtons();
   try{
     const result=await call('/steer',{direction:'stop',supervised:$('supervised').checked});
@@ -210,6 +224,7 @@ document.querySelector('[data-direction="stop"]').onclick=async()=>{
 };
 $('open').onclick=async()=>{
   if(!token||opening)return;
+  $('steertiming').textContent='';$('steertiming').removeAttribute('data-stop-reply-ms');
   const pin=$('pin').value;$('pin').value='';opening=true;
   const generation=++stateGeneration;const allowed=state?.steering_allowed;
   state={phase:'starting',has_frame:false};clearPicture();$('status').textContent='Opening live view…';refreshButtons();
@@ -293,7 +308,7 @@ document.addEventListener('visibilitychange',()=>{
 refreshButtons();
 if(!token)$('status').textContent=accessMessage();
 else poll();
-setInterval(poll,1500);setInterval(frame,250);
+setInterval(poll,1500);setInterval(frame,100);
 setInterval(()=>{
   guardHold();
   if(!freshPicture())$('livebadge').hidden=true;

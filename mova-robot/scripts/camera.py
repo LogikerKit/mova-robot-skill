@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import threading
 import time
@@ -25,6 +26,37 @@ logging.getLogger('protocol').disabled = True
 
 HERE = Path(__file__).resolve().parent
 CAMERA_SESSION_SECONDS = 300
+
+_VIDEO_PHASES = frozenset(('authenticating','authenticated','auth_failed',
+    'querying_encrypted_stream','stream_query_failed','receiving_encrypted_stream','stream_ended','error'))
+_VIDEO_ERROR_CODES = frozenset(
+    'VIDEO_MEDIA_'+name for name in ('KEY','DECRYPT','CLOSED','FRAME','CODEC','INPUT','URL',
+        'OUTPUT','EMPTY','TIMEOUT','BACKPRESSURE','REJECTED','RELAY')) | frozenset(
+    'VIDEO_WORKER_'+name for name in ('INPUT_TOO_LARGE','INVALID_INPUT','INVALID_MODE',
+        'PRIVATE_PIPE_REQUIRED','ABORTED','INVALID_DURATION','INVALID_CACHE','STREAM_QUERY_FAILED','FAILED'))
+
+
+def _safe_video_report(raw):
+    """Reject arbitrary stderr; retain only fixed enums and bounded numbers."""
+    if len(raw)>1024:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError,TypeError,RecursionError):
+        return None
+    if not isinstance(value,dict) or not isinstance(value.get('phase'),str) or value['phase'] not in _VIDEO_PHASES:
+        return None
+    result = {'phase':value['phase']}
+    if value['phase']=='error':
+        code = value.get('code')
+        result['code'] = code if isinstance(code,str) and code in _VIDEO_ERROR_CODES else 'VIDEO_WORKER_FAILED'
+    for key in ('httpStatus','responseCode','videoFrames','audioFrames'):
+        number = value.get(key)
+        if type(number) is int and 0<=number<=2_147_483_647:
+            result[key] = number
+    if value.get('endedBy') in ('aborted','duration','peer','unknown'):
+        result['endedBy'] = value['endedBy']
+    return result
 
 
 class CameraError(RuntimeError):
@@ -162,11 +194,16 @@ class CameraSession:
         self.close_reason = None
         self.frame = None
         self.frame_at = 0.0
+        self.frame_seq = 0
+        self.frame_epoch = 0
         self.last_client = time.monotonic()
         self.camera_stop_acknowledged = None
         self.steering_disabled = False
         self._steering_controller = None
         self._active_hold = None
+        self._last_hold_timing = None
+        self._video_reports = []
+        self._video_exit_codes = {'receiver':None,'decoder':None}
         # Never evict an ID while this viewer can receive delayed requests.
         # A full table fails closed rather than reviving a released gesture.
         self._hold_records = {}
@@ -177,10 +214,14 @@ class CameraSession:
             if touch:
                 self.last_client = time.monotonic()
             return {'phase':self.phase,'message':self.message,'has_frame':self.frame is not None,
+                'frame_seq':self.frame_seq,'frame_epoch':self.frame_epoch,
                 'frame_age_ms':int((time.monotonic()-self.frame_at)*1000) if self.frame_at else None,
                 'remaining_seconds':max(0, int(self.deadline-time.monotonic())) if self.deadline else 0,
                 'steering_allowed':self.allow_steering and not self.steering_disabled,
                 'steering_active':self.steer_lock.locked(),
+                'steering_timing':dict(self._last_hold_timing) if self._last_hold_timing else None,
+                'video_diagnostics':{'worker_reports':[dict(report) for report in self._video_reports],
+                    'exit_codes_before_cleanup':dict(self._video_exit_codes)},
                 'close_reason':self.close_reason,
                 'camera_stop_acknowledged':self.camera_stop_acknowledged}
 
@@ -198,11 +239,16 @@ class CameraSession:
                 raise CameraError('Camera close was not confirmed. Check MOVAhome and restart this viewer.')
             self.cancel.clear()
             self.frame, self.frame_at = None, 0.0
+            self.frame_seq = 0
+            self.frame_epoch += 1
             self.camera_stop_acknowledged = None
             self.close_reason = None
             self.last_client = time.monotonic()
             self.deadline = 0.0
             self._steering_controller = None
+            self._last_hold_timing = None
+            self._video_reports = []
+            self._video_exit_codes = {'receiver':None,'decoder':None}
             self._state('starting','Signing in to the video service…')
             self.worker = threading.Thread(target=self._run,args=(pin,),daemon=False)
             self.worker.start()
@@ -251,6 +297,53 @@ class CameraSession:
             for pipe in (p.stdin,p.stdout):
                 if pipe and not pipe.closed:pipe.close()
 
+    def _read_video_reports(self, pipe, done):
+        # Drain continuously so stderr cannot stall video output. Nonblocking
+        # reads plus a short select timeout allow bounded cleanup even when a
+        # child leaves its pipe open. Never retain an arbitrary/raw line.
+        pending = b''
+        discarding = False
+        try:
+            descriptor = pipe.fileno()
+            os.set_blocking(descriptor,False)
+            while not done.is_set():
+                if not select.select([descriptor],[],[],0.1)[0]:continue
+                try:chunk = os.read(descriptor,1024)
+                except BlockingIOError:continue
+                if not chunk:break
+                parts = chunk.split(b'\n')
+                for index,part in enumerate(parts):
+                    if not discarding:
+                        if len(pending)+len(part)>1024:
+                            pending,discarding = b'',True
+                        else:
+                            pending += part
+                    if index<len(parts)-1:
+                        if not discarding:self._store_video_report(pending)
+                        pending,discarding = b'',False
+            if pending and not discarding:self._store_video_report(pending)
+        except Exception:
+            # Process/pipe teardown must never prevent the camera end command.
+            pass
+
+    def _store_video_report(self, raw):
+        report = _safe_video_report(raw)
+        if report is not None:
+            with self.lock:
+                self._video_reports.append(report)
+                del self._video_reports[:-8]
+
+    def _record_video_exits(self, receiver, decoder):
+        exited = False
+        for name,process in (('receiver',receiver),('decoder',decoder)):
+            if process is None:continue
+            try:code = process.poll()
+            except Exception:continue
+            if type(code) is int and -255<=code<=255:
+                with self.lock:self._video_exit_codes[name] = code
+                exited = True
+        return exited
+
     def _read_frames(self, pipe):
         buffer = bytearray()
         while not self.cancel.is_set():
@@ -267,6 +360,7 @@ class CameraSession:
                 with self.lock:
                     self.frame = bytes(buffer[begin:end+2])
                     self.frame_at = time.monotonic()
+                    self.frame_seq += 1
                 del buffer[:end+2]
 
     def _run(self, pin):
@@ -274,6 +368,9 @@ class CameraSession:
         session = None
         processes = []
         reader = None
+        report_reader = None
+        report_done = threading.Event()
+        node = decoder = None
         failure = None
         try:
             path = mova.CONFIG/'video-app.json'
@@ -329,14 +426,17 @@ class CameraSession:
             self._check_cancel()
             self.deadline = time.monotonic()+CAMERA_SESSION_SECONDS
             node = subprocess.Popen(['node',str(HERE/'video_worker.mjs'),'stream'],
-                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             processes.append(node)
+            report_reader = threading.Thread(target=self._read_video_reports,args=(node.stderr,report_done),daemon=True)
+            report_reader.start()
             node.stdin.write(json.dumps({'identity':identity,'credentials':credentials,'iotId':iot_id,
                 'maxDurationMs':CAMERA_SESSION_SECONDS*1000}).encode())
             node.stdin.close()
             decoder = subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','error','-nostdin',
-                '-fflags','nobuffer','-flags','low_delay','-f','flv','-i','pipe:0','-an',
-                '-vf','fps=5,scale=640:-2','-c:v','mjpeg','-q:v','5','-f','image2pipe','pipe:1'],
+                '-fflags','nobuffer','-flags','low_delay',
+                '-f','flv','-i','pipe:0','-an',
+                '-vf','fps=10,scale=640:-2','-c:v','mjpeg','-threads','1','-q:v','5','-f','image2pipe','pipe:1'],
                 stdin=node.stdout,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
             processes.append(decoder)
             node.stdout.close()
@@ -347,7 +447,7 @@ class CameraSession:
             while time.monotonic()<self.deadline and not self.cancel.wait(0.1):
                 self._check_cancel()
                 now = time.monotonic()
-                if node.poll() is not None or decoder.poll() is not None:
+                if self._record_video_exits(node,decoder):
                     raise CameraError('Video reception stopped. The camera is being closed.')
                 if now-(self.frame_at or started)>25:
                     raise CameraError('No recent video frames arrived. The camera is being closed.')
@@ -366,6 +466,7 @@ class CameraSession:
             pin = None
             self.stop('error' if failure else 'timeout' if self.deadline and
                 time.monotonic()>=self.deadline else 'user')
+            self._record_video_exits(node,decoder)
             for p in reversed(processes):
                 try:
                     if p.poll() is None:p.terminate()
@@ -376,8 +477,13 @@ class CameraSession:
                     except subprocess.TimeoutExpired:p.kill();p.wait(timeout=3)
                 except Exception:pass
             if reader:reader.join(timeout=1)
+            if report_reader:
+                # Allow EOF diagnostics to drain, then end even if EOF is lost.
+                report_reader.join(timeout=0.3)
+                report_done.set()
+                report_reader.join(timeout=0.3)
             for p in reversed(processes):
-                for pipe in (p.stdin,p.stdout):
+                for pipe in (p.stdin,p.stdout,p.stderr):
                     try:
                         if pipe and not pipe.closed:pipe.close()
                     except Exception:pass
@@ -436,7 +542,8 @@ class CameraSession:
                 with self.lock:
                     if self._steering_controller is None:
                         self._steering_controller = SteeringController(
-                            mova.Robot(c),cancel_event=self._steering_cancel)
+                            mova.Robot(c),cancel_event=self._steering_cancel,
+                            timing_callback=self._record_steering_timing)
                     else:
                         self._steering_controller.robot = mova.Robot(c)
                     controller = self._steering_controller
@@ -454,14 +561,28 @@ class CameraSession:
         if not isinstance(hold_id,str) or not re.fullmatch(r'[0-9a-f]{32}',hold_id):
             raise CameraError('Invalid steering gesture identifier.')
 
+    def _record_steering_timing(self, event, at_ms):
+        if event not in ('start_dispatched_ms','start_acknowledged_ms',
+                         'stop_dispatched_ms','stop_acknowledged_ms') or type(at_ms) is not int:
+            return
+        with self.lock:
+            if self._active_hold is not None:
+                self._active_hold['timing'][event] = at_ms
+
     def _new_hold_record(self, hold_id):
         if len(self._hold_records) >= 256:
             raise CameraError('Gesture limit reached. Restart this private viewer before steering again.')
-        record = {'released':False,'done':threading.Event(),'result':None,'error':None}
+        record = {'released':False,'done':threading.Event(),'result':None,'error':None,
+                  'timing':{'clock':'monotonic_ms','measurement':'command_transport',
+                            'hold_received_ms':None,'release_received_ms':None,
+                            'start_dispatched_ms':None,'start_acknowledged_ms':None,
+                            'stop_dispatched_ms':None,'stop_acknowledged_ms':None,
+                            'completed_ms':None}}
         self._hold_records[hold_id] = record
         return record
 
     def hold(self, direction, supervised=False, hold_id=None):
+        received_ms = int(time.monotonic()*1000)
         self._validate_hold_id(hold_id)
         if direction not in ('forward','left','right') or supervised is not True:
             raise CameraError('Hold a direction only while supervising the robot.')
@@ -472,6 +593,7 @@ class CameraSession:
                     return record['result']
                 raise CameraError('This steering gesture has already been used.')
             record = self._new_hold_record(hold_id)
+            record['timing']['hold_received_ms'] = received_ms
             try:
                 if (not self.allow_steering or self.steering_disabled or self.cancel.is_set()
                         or self._pending_stops
@@ -486,6 +608,7 @@ class CameraSession:
             now = time.monotonic()
             record.update(lease_until=now+1.0,hard_deadline=now+5.0)
             self._active_hold = record
+            self._last_hold_timing = record['timing']
             self.motion_cancel.clear()
         result = None
         failure = None
@@ -496,7 +619,8 @@ class CameraSession:
                 with self.lock:
                     if self._steering_controller is None:
                         self._steering_controller = SteeringController(
-                            mova.Robot(cloud),cancel_event=self._steering_cancel)
+                            mova.Robot(cloud),cancel_event=self._steering_cancel,
+                            timing_callback=self._record_steering_timing)
                     else:
                         self._steering_controller.robot = mova.Robot(cloud)
                     controller = self._steering_controller
@@ -513,6 +637,9 @@ class CameraSession:
             raise CameraError(failure) from None
         finally:
             with self.lock:
+                record['timing']['completed_ms'] = int(time.monotonic()*1000)
+                if result is not None:
+                    result['steering_timing'] = dict(record['timing'])
                 record.update(released=True,result=result,error=failure)
                 self._active_hold = None
                 self.steer_lock.release()
@@ -531,6 +658,7 @@ class CameraSession:
             return {'accepted':active,'steering_active':active}
 
     def hold_release(self, hold_id):
+        received_ms = int(time.monotonic()*1000)
         self._validate_hold_id(hold_id)
         with self.lock:
             record = self._hold_records.get(hold_id)
@@ -538,16 +666,21 @@ class CameraSession:
                 record = self._new_hold_record(hold_id)
                 record.update(released=True,result={'released':True,'stop_required':False,
                                                      'stop_acknowledged':None})
+                record['timing']['completed_ms'] = received_ms
                 record['done'].set()
             elif record is self._active_hold:
                 record['released'] = True
                 self.motion_generation += 1
                 self.motion_cancel.set()
+            if record['timing']['release_received_ms'] is None:
+                record['timing']['release_received_ms'] = received_ms
         if not record['done'].wait(15):
             raise CameraError('Steering is still stopping. Check MOVAhome if the robot is moving.')
         if record['error']:
             raise CameraError(record['error'])
-        return record['result']
+        with self.lock:
+            record['result']['steering_timing'] = dict(record['timing'])
+            return record['result']
 
     def close(self):
         self.stop()

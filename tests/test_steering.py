@@ -142,6 +142,43 @@ class SteeringTests(unittest.TestCase):
         self.assertIsNone(result["start_acknowledged"])
         self.assertTrue(result["stop_acknowledged"])
 
+    def test_transport_timings_use_monotonic_clock_and_first_start_only(self):
+        events = []
+        self.controller.timing_callback = lambda name, at: events.append((name, at))
+        def send(*_):
+            self.clock.now += 0.125
+            return [{'code': 0}]
+        self.cloud.send.side_effect = send
+        self.controller.move('left', 1250)
+        self.assertEqual(events, [('start_dispatched_ms', 10000),
+                                  ('start_acknowledged_ms', 10125),
+                                  ('stop_dispatched_ms', 11250),
+                                  ('stop_acknowledged_ms', 11375)])
+        self.assertEqual(len(self.packets()), 3)
+        events.clear()
+        self.controller.move('right', 250)
+        self.assertEqual(events[0], ('start_dispatched_ms', 11375))
+        self.assertEqual(events[-1], ('stop_acknowledged_ms', 11750))
+
+    def test_unknown_stop_response_has_dispatch_time_but_no_ack_time(self):
+        events = []
+        self.controller.timing_callback = lambda name, at: events.append((name, at))
+        self.cloud.send.side_effect = [[{'code': 0}], [{'code': False, 'private': 'FAKE-SECRET'}]]
+        with self.assertRaises(SteeringError):
+            self.controller.move('left')
+        self.assertEqual([name for name, _ in events],
+                         ['start_dispatched_ms', 'start_acknowledged_ms', 'stop_dispatched_ms'])
+        self.assertNotIn('FAKE-SECRET', str(events))
+        self.assertEqual(len(self.packets()), 2)
+
+    def test_failed_timing_consumer_cannot_suppress_stop(self):
+        for error in (RuntimeError('FAKE-DIAGNOSTIC-ERROR'),KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                self.cloud.send.reset_mock()
+                self.controller.timing_callback = Mock(side_effect=error)
+                self.assertTrue(self.controller.move('left')['stop_acknowledged'])
+                self.assertEqual([(p['spdv'], p['spdw']) for p in self.packets()], [(0, 45), (0, 0)])
+
     def test_lowered_sensor_allows_idle_or_remote_without_existing_task(self):
         # Recovered MOVAhome rule permits lowered LDS when no cleaning task is
         # active, including the observed standby state 2 / activity 17.

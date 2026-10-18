@@ -1,6 +1,7 @@
 // Internal subprocess protocol. Parent captures stdout privately; never expose
 // auth output to a terminal, tool result, browser response, or application log.
 import { establishVideoIdentity, queryEncryptedVideoStream } from './video_auth.mjs';
+import { DEFAULT_PLAYBACK_CACHE_MS, validPlaybackCacheMs } from './video_media/playback.mjs';
 
 const mode = process.argv[2];
 const controller = new AbortController();
@@ -66,8 +67,11 @@ try {
   } else {
     const duration = input.maxDurationMs ?? 60000;
     if (!Number.isInteger(duration) || duration < 1000 || duration > 300000) fail('VIDEO_WORKER_INVALID_DURATION');
+    const cacheDurationMs = input.cacheDurationMs === undefined ? DEFAULT_PLAYBACK_CACHE_MS : input.cacheDurationMs;
+    if (!validPlaybackCacheMs(cacheDurationMs)) fail('VIDEO_WORKER_INVALID_CACHE');
     report('querying_encrypted_stream');
-    const result = await queryEncryptedVideoStream(input.identity, input.credentials, input.iotId, { signal: controller.signal });
+    const result = await queryEncryptedVideoStream(input.identity, input.credentials, input.iotId,
+      { signal: controller.signal, cacheDurationMs });
     if (terminating || brokenOutput) fail('VIDEO_WORKER_ABORTED');
     if (!result.ok || !result.stream?.encrypted) {
       report('stream_query_failed', safeResult(result));
@@ -81,6 +85,7 @@ try {
       output: process.stdout,
       signal: controller.signal,
       maxDurationMs: duration,
+      cacheDurationMs,
       connectTimeoutMs: 10000,
       idleTimeoutMs: 15000,
       endOutput: false,

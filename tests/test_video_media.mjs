@@ -34,6 +34,33 @@ function initialized() {
   return decryptor;
 }
 
+test('RTMP requests zero playback cache and replaces only an existing cache field', () => {
+  const plain = parseRelayUrl(url);
+  assert.equal(plain.app, 'live?token=SENSITIVE_TEST_TOKEN&cacheDuration=0');
+  assert.equal(plain.playpath, 'stream');
+  for (const app of [
+    'live?token=signed%2Bvalue%3D&cacheDuration=3000&other=%2F',
+    'live?cacheDuration=3000&token=signed%2Bvalue%3D&other=%2F',
+    'live?token=signed%2Bvalue%3D&cacheDuration&other=%2F',
+  ]) {
+    const actual = parseRelayUrl(`rtmp://relay.example.invalid:8000/${app}/stream?auth=keep%2Bexact`);
+    assert.equal(actual.app, app.replace(/cacheDuration(?:=3000)?/, 'cacheDuration=0'));
+    assert.equal(actual.playpath, 'stream?auth=keep%2Bexact');
+    assert.equal(actual.tcUrl, `rtmp://relay.example.invalid:8000/${actual.app}`);
+  }
+  assert.equal(parseRelayUrl(url, 3000).app, 'live?token=SENSITIVE_TEST_TOKEN&cacheDuration=3000');
+  assert.throws(() => parseRelayUrl('rtmp://relay.example.invalid/live?cacheDuration=0&cacheDuration=3000/stream'), /Ambiguous/);
+});
+
+test('cache validation rejects unsafe input instead of interpolating it into the relay URL', () => {
+  for (const cacheDurationMs of [-1, 3001, 0.5, '0', true, null, NaN, Infinity, '0&SENSITIVE_TEST_TOKEN']) {
+    assert.throws(() => parseRelayUrl(url, cacheDurationMs), error => {
+      assert.match(error.message, /Invalid video playback cache/);
+      assert.doesNotMatch(error.message, /SENSITIVE_TEST_TOKEN/);return true;
+    });
+  }
+});
+
 test('AES-CBC configuration keeps clear FLV header and native trailing padding', () => {
   const decryptor = new RelayMediaDecryptor(secrets);
   const result = decryptor.video(encryptedConfig);
@@ -193,7 +220,16 @@ test('receiver streams playable-format FLV through supplied Writable and dispose
   assert.deepEqual(dest.bytes().subarray(0, 13), FLV_HEADER);
   assert.ok(dest.bytes().includes(nals));
   assert.equal(holder.client.closed, true);
+  assert.equal(holder.client.options.cacheDurationMs, 0);
   assert.throws(() => holder.client.options.decryptAudio(encrypt(Buffer.from([0x72, 1]))), { code: 'VIDEO_MEDIA_CLOSED' });
+});
+
+test('receiver forwards an explicitly validated cache value without changing encryption', async () => {
+  const dest = destination();const holder = {};
+  await receiveEncryptedFlv({ url, relayDecryptKey: secrets, output: dest.output, cacheDurationMs: 3000,
+    clientFactory: fixtureFactory((client, options) => { emitVideo(client, options);client.emit('close'); }, holder) });
+  assert.equal(holder.client.options.cacheDurationMs, 3000);
+  assert.ok(dest.bytes().includes(nals));
 });
 
 test('abort stops receiver without opening a transport when already cancelled', async () => {
@@ -225,7 +261,8 @@ test('media decryption errors are preserved and transport errors cannot disclose
 });
 
 test('invalid inputs and plaintext request cannot start a transport', async () => {
-  for (const changes of [{ relayDecryptKey: null }, { url: 'rtmps://bad/SENSITIVE_TEST_TOKEN' }, { url: 'http://bad/SENSITIVE_TEST_TOKEN' }, { maxDurationMs: 300001 }, { maxDurationMs: true }]) {
+  for (const changes of [{ relayDecryptKey: null }, { url: 'rtmps://bad/SENSITIVE_TEST_TOKEN' }, { url: 'http://bad/SENSITIVE_TEST_TOKEN' }, { maxDurationMs: 300001 }, { maxDurationMs: true },
+    ...[-1, 3001, 0.5, '0', true, null, NaN, Infinity].map(cacheDurationMs => ({ cacheDurationMs }))]) {
     const dest = destination(); let created = false;
     await assert.rejects(receiveEncryptedFlv({ url, relayDecryptKey: secrets, output: dest.output,
       ...changes, clientFactory: () => { created = true; } }), error => {

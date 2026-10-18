@@ -161,6 +161,75 @@ class HoldTests(unittest.TestCase):
         self.assertEqual(self.speeds(),[45,0])
         self.assertEqual(self.waits,[])
 
+    def test_release_and_stop_timings_are_live_and_preserve_transport_latency(self):
+        release_seen=threading.Event()
+        released=[]
+        release_errors=[]
+        snapshots=[]
+        original_set=self.manager.motion_cancel.set
+        def cancel():
+            original_set()
+            release_seen.set()
+        def release():
+            try:released.append(self.manager.hold_release(HOLD_ID))
+            except BaseException as error:release_errors.append(error)
+        releasing=threading.Thread(target=release)
+        def wait(_):
+            self.now=10.375
+            releasing.start()
+            self.assertTrue(release_seen.wait(1))
+            snapshots.append(self.manager.status()['steering_timing'])
+            return True
+        def send(method,params,retries):
+            result=self.send(method,params,retries)
+            self.now+=0.125 if len(self.dispatches)==1 else 0.25
+            return result
+        self.cloud.send.side_effect=send
+        with patch.object(self.manager.motion_cancel,'set',side_effect=cancel), \
+                patch.object(self.manager.motion_cancel,'wait',side_effect=wait):
+            result=self.run_hold()
+            releasing.join(1)
+        self.assertFalse(releasing.is_alive())
+        self.assertEqual(release_errors,[])
+        self.assertEqual(snapshots[0]['release_received_ms'],10375)
+        self.assertIsNone(snapshots[0]['stop_dispatched_ms'])
+        expected={'clock':'monotonic_ms','measurement':'command_transport',
+                  'hold_received_ms':10000,'release_received_ms':10375,
+                  'start_dispatched_ms':10000,'start_acknowledged_ms':10125,
+                  'stop_dispatched_ms':10375,'stop_acknowledged_ms':10625,'completed_ms':10625}
+        self.assertEqual(result['steering_timing'],expected)
+        self.assertEqual(released[0]['steering_timing'],expected)
+        self.assertEqual(self.manager.status()['steering_timing'],expected)
+        self.now=11.0
+        self.assertEqual(self.manager.hold_release(HOLD_ID)['steering_timing'],expected)
+        snapshot=self.manager.status()['steering_timing']
+        snapshot['stop_acknowledged_ms']=0
+        self.assertEqual(self.manager.status()['steering_timing'],expected)
+        self.assertNotIn(HOLD_ID,json.dumps(self.manager.status()))
+        self.assertEqual(self.speeds(),[45,0])
+
+    def test_unknown_stop_ack_remains_unconfirmed_in_last_hold_timing(self):
+        self.cancel_at=10.2
+        self.fail_send=2
+        with self.assertRaises(SteeringError):self.run_hold()
+        timing=self.manager.status()['steering_timing']
+        self.assertEqual(timing['stop_dispatched_ms'],10200)
+        self.assertIsNone(timing['stop_acknowledged_ms'])
+        self.assertIsNone(timing['release_received_ms'])
+        self.assertEqual(timing['completed_ms'],10200)
+        self.assertTrue(self.manager.steering_disabled)
+
+    def test_release_before_start_has_no_fabricated_command_timings(self):
+        result=self.manager.hold_release(HOLD_ID)
+        timing=result['steering_timing']
+        self.assertEqual(timing['release_received_ms'],10000)
+        self.assertTrue(all(timing[key] is None for key in
+            ('hold_received_ms','start_dispatched_ms','start_acknowledged_ms',
+             'stop_dispatched_ms','stop_acknowledged_ms')))
+        self.assertIsNone(self.manager.status()['steering_timing'])
+        self.assertEqual(self.run_hold(),result)
+        self.assertEqual(self.dispatches,[])
+
     def test_release_before_start_and_late_heartbeat_cannot_create_motion(self):
         released=self.manager.hold_release(HOLD_ID)
         self.assertFalse(released['stop_required'])

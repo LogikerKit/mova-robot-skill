@@ -9,6 +9,7 @@ import secrets
 import shutil
 import signal
 import threading
+import time
 from urllib.parse import urlsplit
 
 from camera import CameraSession, CloudAccess, CameraError
@@ -33,11 +34,12 @@ def make_handler(manager, token, closing=None, start_gate=None):
             supplied = self.headers.get('X-Viewer-Token','').encode('utf-8')
             return not authenticated or secrets.compare_digest(supplied,token.encode('utf-8'))
 
-        def _reply(self, code, body, content_type='application/json'):
+        def _reply(self, code, body, content_type='application/json', extra_headers=None):
             if not isinstance(body,bytes):body=json.dumps(body).encode()
             self.send_response(code)
             self.send_header('Content-Type',content_type)
             self.send_header('Content-Length',str(len(body)))
+            for name,value in (extra_headers or {}).items():self.send_header(name,str(value))
             self.send_header('Cache-Control','no-store')
             self.send_header('Referrer-Policy','no-referrer')
             self.send_header('X-Content-Type-Options','nosniff')
@@ -60,7 +62,11 @@ def make_handler(manager, token, closing=None, start_gate=None):
             if path=='/frame':
                 with manager.lock:
                     frame=manager.frame
-                return self._reply(200,frame,'image/jpeg') if frame else self._reply(204,b'')
+                    decoded=manager.frame_at
+                    meta={'X-Frame-Sequence':manager.frame_seq,'X-Frame-Epoch':manager.frame_epoch,
+                        'X-Frame-Decoded-Monotonic-Ms':round(decoded*1000,3),
+                        'X-Frame-Age-Ms':max(0,round((time.monotonic()-decoded)*1000,3))}
+                return self._reply(200,frame,'image/jpeg',meta) if frame else self._reply(204,b'')
             return self._reply(404,{'error':'Not found.'})
 
         def do_POST(self):

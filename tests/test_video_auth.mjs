@@ -187,6 +187,7 @@ test('encrypted relay uses one signed request with mandatory encryption and no c
   const body = JSON.parse(calls[0].options.body);
   assert.equal(body.params.iotId, 'FAKE-IOT-DEVICE');
   assert.equal(body.params.relayEncrypted, true);
+  assert.equal(body.params.cacheDuration, 0);
   assert.equal(body.request.apiVer, '2.2.0');
   assert.equal(body.request.iotToken, identity.iotToken);
   assert.equal(result.ok, true);
@@ -208,6 +209,19 @@ test('invalid or expired identity cannot make a relay request', async t => {
     assertPrivate(result);
   }
   assert.equal(calls.length, 0);
+});
+
+test('playback cache accepts explicit compatibility values and rejects invalid inputs before requests', async t => {
+  const calls = mockFetch(t, [{ json: encrypted }]);
+  const result = await queryEncryptedVideoStream(identity, credentials, 'device', { cacheDurationMs: 3000 });
+  assert.equal(result.ok, true);
+  assert.equal(JSON.parse(calls[0].options.body).params.cacheDuration, 3000);
+  verifySignature(calls[0], false);
+  for (const cacheDurationMs of [-1, 3001, 0.5, '0', true, null, NaN, Infinity]) {
+    const invalid = await queryEncryptedVideoStream(identity, credentials, 'device', { cacheDurationMs });
+    assert.equal(invalid.ok, false);assert.equal(invalid.errorType, 'InvalidInput');assertPrivate(invalid);
+  }
+  assert.equal(calls.length, 1);
 });
 
 test('relay rejects plaintext, missing keys, unsupported URLs, HTTP and API errors', async t => {
@@ -334,6 +348,8 @@ test('worker validates mode, JSON input, size, and duration without network or m
     [['stream'], JSON.stringify({ maxDurationMs: 300001 }), 'VIDEO_WORKER_INVALID_DURATION'],
     [['stream'], JSON.stringify({ maxDurationMs: true }), 'VIDEO_WORKER_INVALID_DURATION'],
     [['stream'], JSON.stringify({ maxDurationMs: '1000' }), 'VIDEO_WORKER_INVALID_DURATION'],
+    ...[-1, 3001, 0.5, '0', true, null].map(cacheDurationMs =>
+      [['stream'], JSON.stringify({ cacheDurationMs }), 'VIDEO_WORKER_INVALID_CACHE']),
   ]) {
     const result = runEntry(worker, args, stdin, []);
     assert.equal(result.status, 2);

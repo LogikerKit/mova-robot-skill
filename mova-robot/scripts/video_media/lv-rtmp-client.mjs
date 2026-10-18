@@ -26,6 +26,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { amfBoolean, amfNull, amfNumber, amfObject, amfString, decodeAmf0, } from './amf0.mjs';
 import { ChunkReader, MSG, PRIVATE_MODE_CHUNK_SIZE, encodeMessage, } from './chunk.mjs';
+import { DEFAULT_PLAYBACK_CACHE_MS, validPlaybackCacheMs } from './playback.mjs';
 
 export const LV_STATUS = {
   REQUEST_AUDIO_TYPE: 'NetStream.RequestAudioType',
@@ -48,7 +49,6 @@ const PLAY_START_LIVE = -1000; // RTMP_LF_LIVE -> start = -1000
 const HANDSHAKE_C0_PRIVATE = 0x04;
 const HANDSHAKE_S0S1_LEN = 1537;
 const DEFAULT_PING_INTERVAL_MS = 30_000; // ProcessRtmpStream: 30000
-const DEFAULT_CACHE_DURATION_MS = 3000; // app: "&cacheDuration=3000"
 const ACK_THRESHOLD_BYTES = 250_000; // librtmp: m_nClientBW(2500000)/10
 const CSID_CONTROL = 2;
 const CSID_COMMAND = 3;
@@ -59,7 +59,8 @@ const PLAY_STREAM_ID = 1; // RTMP_InitPrivateConfig: m_stream_id = 1
  * Split like librtmp/ffmpeg do: playpath = last path segment, app = everything between host and it
  * (query string included). Verified against the app's connect/play in both pcaps.
  */
-export function parseRelayUrl(url , cacheDurationMs ) {
+export function parseRelayUrl(url, cacheDurationMs = DEFAULT_PLAYBACK_CACHE_MS) {
+  if (!validPlaybackCacheMs(cacheDurationMs)) throw new Error('Invalid video playback cache');
   const m = /^rtmp:\/\/([^/:]+)(?::(\d+))?\/(.*)$/.exec(url);
   if (!m) throw new Error('Invalid relay URL; expected rtmp://');
   const host = m[1] ;
@@ -69,7 +70,13 @@ export function parseRelayUrl(url , cacheDurationMs ) {
   if (slash < 0) throw new Error('Invalid relay URL; missing stream path');
   let app = path.slice(0, slash);
   const playpath = path.slice(slash + 1);
-  if (!/[?&]cacheDuration=/.test(app)) app += `${app.includes('?') ? '&' : '?'}cacheDuration=${cacheDurationMs}`;
+  // Preserve signed/token URL bytes. Only the explicit playback-cache field
+  // changes; a cached descriptor must not silently reinstate the old delay.
+  const cacheFields = app.match(/[?&]cacheDuration(?:=[^&]*)?(?=&|$)/g) ?? [];
+  if (cacheFields.length > 1) throw new Error('Ambiguous video playback cache');
+  if (cacheFields.length) app = app.replace(/([?&])cacheDuration(?:=[^&]*)?(?=&|$)/,
+    (_, separator) => `${separator}cacheDuration=${cacheDurationMs}`);
+  else app += `${app.includes('?') ? '&' : '?'}cacheDuration=${cacheDurationMs}`;
   return { host, port, app, playpath, tcUrl: `rtmp://${host}:${port}/${app}` };
 }
 
@@ -98,7 +105,7 @@ export class LvRtmpClient extends EventEmitter {
       decryptAudio: options.decryptAudio,
       decryptVideo: options.decryptVideo,
       url: options.url,
-      cacheDurationMs: options.cacheDurationMs ?? DEFAULT_CACHE_DURATION_MS,
+      cacheDurationMs: options.cacheDurationMs === undefined ? DEFAULT_PLAYBACK_CACHE_MS : options.cacheDurationMs,
       requestAudioType: options.requestAudioType ?? true,
       ping: options.ping ?? true,
       pingIntervalMs: options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS,

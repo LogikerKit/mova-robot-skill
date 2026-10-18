@@ -32,7 +32,7 @@ class Element extends Target{
 function browser({hash='#'+TOKEN,storage=new Map(),origin='http://127.0.0.1:54321',phase='live'}={}){
   let now=10000,nextTimer=1,random=0,nextBlob=0;
   const timers=new Map(),calls=[],pending=new Map(),routes=new Map();
-  const elements=Object.fromEntries(['picture','empty','livebadge','status','dot','countdown','open','close','pin','supervised','steerstatus','steerhint','reconnect'].map(id=>[id,new Element(id)]));
+  const elements=Object.fromEntries(['picture','empty','livebadge','status','dot','countdown','open','close','pin','supervised','steerstatus','steerhint','steertiming','reconnect'].map(id=>[id,new Element(id)]));
   elements.picture.hidden=true;
   const buttons=['left','forward','right','stop'].map(direction=>new Element(direction,direction));
   const document=new Target();document.hidden=false;document.getElementById=id=>elements[id];
@@ -144,6 +144,31 @@ test('release before start completion is tombstoned and cancellation stays reusa
   assert.equal(b.elements.supervised.checked,true);assert.equal(b.buttons[0].disabled,false);
   assert.match(b.elements.steerstatus.textContent,/cancelled before it started/);
   await b.advance(500);assert.equal(b.count('/steer/heartbeat').length,0);
+});
+
+test('release timing measures delayed stop confirmation without claiming physical stop',async()=>{
+  const b=browser();await b.ready();const released=deferred();
+  b.routes.set('/steer/release',()=>released.promise);
+  b.buttons[0].dispatch('pointerdown');await b.advance(250);
+  const id=b.count('/steer/hold')[0].body.hold_id;
+  b.buttons[0].dispatch('pointerup');await b.advance(180);
+  released.resolve(response({stop_acknowledged:true}));
+  b.pending.get(id).resolve(response({stop_acknowledged:true}));await flush();
+  assert.equal(b.elements.steertiming.attributes['data-stop-reply-ms'],'180');
+  assert.match(b.elements.steertiming.textContent,/180 ms.*communication, not physical stopping/);
+  b.buttons[2].dispatch('pointerdown',{pointerId:2});await flush();
+  assert.equal(b.elements.steertiming.textContent,'');
+  assert.equal(b.elements.steertiming.attributes['data-stop-reply-ms'],undefined);
+});
+
+test('cancelled-before-start does not produce a stop acknowledgement timing',async()=>{
+  const b=browser();await b.ready();const stopped={stop_required:false,stop_acknowledged:null};
+  b.routes.set('/steer/release',body=>{
+    b.pending.get(body.hold_id).resolve(response(stopped));return response(stopped);
+  });
+  b.buttons[0].dispatch('pointerdown');b.buttons[0].dispatch('pointerup');await flush();
+  assert.equal(b.elements.steertiming.textContent,'');
+  assert.equal(b.elements.steertiming.attributes['data-stop-reply-ms'],undefined);
 });
 
 for(const event of ['pointercancel','lostpointercapture','blur'])test(`${event} releases once without waiting for the hold reply`,async()=>{

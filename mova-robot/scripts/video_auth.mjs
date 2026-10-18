@@ -6,6 +6,7 @@
 // MOVA app credentials remain outside this file, extracted from user-supplied APK.
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { DEFAULT_PLAYBACK_CACHE_MS, validPlaybackCacheMs } from './video_media/playback.mjs';
 
 const REGION_IDS = ['eu-central-1', 'us-east-1', 'cn-shanghai', 'ap-southeast-1'];
 const httpOk = status => Number.isInteger(status) && status >= 200 && status < 300;
@@ -105,11 +106,12 @@ try {
  * in a finally block. No retries, vendor changes, PIN attempts, or logging occur.
  * Successful `stream` contains private URL/key material: retain only in memory.
  */
-export async function queryEncryptedVideoStream(identity, credentials, iotId, { signal } = {}) {
+export async function queryEncryptedVideoStream(identity, credentials, iotId,
+  { signal, cacheDurationMs = DEFAULT_PLAYBACK_CACHE_MS } = {}) {
   const stage = 'stream/query';
   if (!identity || !REGION_IDS.includes(identity.regionId) || !validText(identity.iotToken)
       || !credentials || !validText(credentials.appKey, 512) || !validText(credentials.appSecret, 4096)
-      || !validText(iotId, 512)) {
+      || !validText(iotId, 512) || !validPlaybackCacheMs(cacheDurationMs)) {
     return { ok: false, stage, errorType: 'InvalidInput' };
   }
   if (typeof identity.expiresAt === 'number' && identity.expiresAt <= Date.now()) {
@@ -120,7 +122,7 @@ export async function queryEncryptedVideoStream(identity, credentials, iotId, { 
     id: randomUUID().toUpperCase(),
     params: {
       streamType: 0, needDomainName: true, relayEncryptType: 0, clientType: 'iOS', iotId,
-      enablePortPredict: true, enableWebSocket: true, forceIFrame: true, cacheDuration: 3000,
+      enablePortPredict: true, enableWebSocket: true, forceIFrame: true, cacheDuration: cacheDurationMs,
       // Mandatory; plaintext relay fallback is deliberately unavailable.
       relayEncrypted: true,
     },

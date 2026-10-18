@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -274,6 +275,39 @@ class CameraTests(unittest.TestCase):
         self.assertEqual(self.operations()[-1][2]["operation"], "end")
         self.assertTrue(self.session.camera_stop_acknowledged)
 
+    def test_receiver_failure_preserves_filtered_reports_and_both_exit_codes_then_closes(self):
+        self.cloud.send.side_effect=self.successful_ack
+        read_fd,write_fd=os.pipe()
+        os.write(write_fd,b'{"phase":"stream_query_failed","httpStatus":403,"private":"FAKE-SECRET"}\n'
+                          b'{"phase":"error","code":"VIDEO_WORKER_STREAM_QUERY_FAILED"}\n')
+        os.close(write_fd)
+        node=Mock()
+        node.stdin=io.BytesIO()
+        node.stdout=io.BytesIO()
+        node.stderr=os.fdopen(read_fd,'rb',buffering=0)
+        node.poll.return_value=2
+        decoder=Mock()
+        decoder.stdin=node.stdout
+        decoder.stdout=io.BytesIO()
+        decoder.stderr=None
+        decoder.poll.return_value=1
+        with patch.object(self.session,'_authenticate',return_value=self.identity), \
+                patch.object(self.session.cancel,'wait',return_value=False), \
+                patch.object(camera.subprocess,'Popen',side_effect=[node,decoder]) as popen:
+            self.session._run('1234')
+        self.assertEqual(popen.call_args_list[0].kwargs['stderr'],camera.subprocess.PIPE)
+        self.assertEqual(popen.call_args_list[1].kwargs['stderr'],camera.subprocess.DEVNULL)
+        diagnostics=self.session.status()['video_diagnostics']
+        self.assertEqual(diagnostics['exit_codes_before_cleanup'],{'receiver':2,'decoder':1})
+        self.assertEqual(diagnostics['worker_reports'],[
+            {'phase':'stream_query_failed','httpStatus':403},
+            {'phase':'error','code':'VIDEO_WORKER_STREAM_QUERY_FAILED'}])
+        self.assertEqual(self.session.phase,'error')
+        self.assertTrue(self.session.camera_stop_acknowledged)
+        self.assertTrue(node.stderr.closed)
+        self.assertEqual(self.operations()[-1][2]['operation'],'end')
+        self.assertNotIn('FAKE-SECRET',json.dumps(self.session.status()))
+
     def test_live_session_and_stream_worker_share_five_minute_limit(self):
         self.cloud.send.side_effect = self.successful_ack
         now = [100.0]
@@ -337,6 +371,17 @@ class CameraTests(unittest.TestCase):
         with patch.object(camera.threading, 'Thread'):
             self.session.start('1234')
         self.assertIsNone(self.session.status()['close_reason'])
+
+    def test_new_camera_session_changes_frame_epoch_and_resets_sequence(self):
+        self.assertEqual(self.session.status()['frame_epoch'],0)
+        self.assertEqual(self.session.status()['frame_seq'],0)
+        with patch.object(camera.threading,'Thread') as thread:
+            self.session.start('1234')
+            self.session.frame_seq=17
+            thread.return_value.is_alive.return_value=False
+            self.session.start('1234')
+        self.assertEqual(self.session.status()['frame_epoch'],2)
+        self.assertEqual(self.session.status()['frame_seq'],0)
 
     def test_cloud_lock_released_and_rotated_token_saved_on_exception(self):
         access = camera.CloudAccess("123")
@@ -412,7 +457,8 @@ class CameraTests(unittest.TestCase):
             expected = {"stop_acknowledged": True}
             controller.return_value.move.return_value = expected
             self.assertEqual(self.session.steer("stop"), expected)
-            controller.assert_called_once_with(robot.return_value, cancel_event=self.session._steering_cancel)
+            controller.assert_called_once_with(robot.return_value, cancel_event=self.session._steering_cancel,
+                                               timing_callback=self.session._record_steering_timing)
             controller.return_value.move.assert_called_once_with("stop", 250)
             self.session.allow_steering = True
             self.session.steering_disabled = False
@@ -513,7 +559,8 @@ class CameraTests(unittest.TestCase):
             self.session.steer("left", True)
             self.access.cloud = second_cloud
             self.session.steer("right", True)
-        controller.assert_called_once_with(first_robot, cancel_event=self.session._steering_cancel)
+        controller.assert_called_once_with(first_robot, cancel_event=self.session._steering_cancel,
+                                           timing_callback=self.session._record_steering_timing)
         self.assertIs(controller.return_value.robot, second_robot)
         self.assertEqual(robot.call_args_list[0].args, (self.cloud,))
         self.assertEqual(robot.call_args_list[1].args, (second_cloud,))

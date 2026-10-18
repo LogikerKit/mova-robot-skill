@@ -2,6 +2,7 @@
 // RTMP primitives are adapted from nodedreame 1.12.4; see LICENSE and README.md.
 import { LvRtmpClient, parseRelayUrl } from './lv-rtmp-client.mjs';
 import { MAX_MEDIA_BYTES, RelayMediaDecryptor, VideoMediaError } from './crypto.mjs';
+import { DEFAULT_PLAYBACK_CACHE_MS, validPlaybackCacheMs } from './playback.mjs';
 
 export { RelayMediaDecryptor, VideoMediaError } from './crypto.mjs';
 
@@ -31,12 +32,12 @@ function duration(value, fallback, min, max) {
   return selected;
 }
 
-function checkUrl(url) {
+function checkUrl(url, cacheDurationMs) {
   if (typeof url !== 'string' || url.length > 16384 || /[\s\x00-\x1f\x7f]/.test(url)) {
     throw new VideoMediaError('URL', 'Invalid encrypted relay address.');
   }
   try {
-    const endpoint = parseRelayUrl(url, 3000);
+    const endpoint = parseRelayUrl(url, cacheDurationMs);
     if (!/^[A-Za-z0-9.-]+$/.test(endpoint.host) || !Number.isInteger(endpoint.port) ||
         endpoint.port < 1 || endpoint.port > 65535 || !endpoint.playpath || !endpoint.app) {
       throw new Error();
@@ -56,9 +57,13 @@ function checkUrl(url) {
 export async function receiveEncryptedFlv({
   url, relayDecryptKey, output, signal,
   maxDurationMs, connectTimeoutMs, idleTimeoutMs, endOutput = true,
+  cacheDurationMs = DEFAULT_PLAYBACK_CACHE_MS,
   clientFactory = options => new LvRtmpClient(options),
 } = {}) {
-  checkUrl(url);
+  if (!validPlaybackCacheMs(cacheDurationMs)) {
+    throw new VideoMediaError('INPUT', 'Invalid video playback cache.');
+  }
+  checkUrl(url, cacheDurationMs);
   if (!output || typeof output.write !== 'function' || typeof output.on !== 'function' ||
       typeof output.off !== 'function' || typeof output.end !== 'function' || output.destroyed) {
     throw new VideoMediaError('OUTPUT', 'A writable local video destination is required.');
@@ -74,7 +79,7 @@ export async function receiveEncryptedFlv({
   let client;
   try {
     client = clientFactory({
-      url, connectTimeoutMs: connectTimeout,
+      url, connectTimeoutMs: connectTimeout, cacheDurationMs,
       decryptVideo: body => decryptor.video(body),
       decryptAudio: body => decryptor.audio(body),
     });

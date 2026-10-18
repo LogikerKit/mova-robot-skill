@@ -49,6 +49,7 @@ class SteeringController:
         timestamp=time.time,
         random_int=secrets.randbelow,
         cancel_event=None,
+        timing_callback=None,
     ):
         self.robot = robot
         self.clock = clock
@@ -56,6 +57,8 @@ class SteeringController:
         self.timestamp = timestamp
         self.random_int = random_int
         self.cancel_event = cancel_event
+        self.timing_callback = timing_callback
+        self._start_timing_sent = False
         # MOVAhome announces the first nonzero command from a mounted remote
         # controller, then keeps audio false even after release/stop.
         self._announce_next_movement = True
@@ -111,6 +114,15 @@ class SteeringController:
                 "Navigation sensor state is unknown; no movement sent."
             )
 
+    def _report_timing(self, event):
+        # Diagnostic failures must never prevent the explicit stop command.
+        # These times describe transport events, not observed physical motion.
+        if self.timing_callback is not None:
+            try:
+                self.timing_callback(event, int(self.clock() * 1000))
+            except BaseException:
+                pass
+
     def _send(self, preset, *, audio):
         cloud = self.robot.cloud
         payload = json.dumps(
@@ -125,6 +137,13 @@ class SteeringController:
         )
         did = str(cloud._did)
         # Zero retries is essential: a timed-out movement may have executed.
+        is_stop = preset == (0, 0)
+        is_start = not is_stop and not self._start_timing_sent
+        if is_start:
+            self._start_timing_sent = True
+            self._report_timing('start_dispatched_ms')
+        if is_stop:
+            self._report_timing('stop_dispatched_ms')
         result = cloud.send(
             "set_properties",
             [{"did": did, "siid": 4, "piid": 15, "value": payload}],
@@ -138,11 +157,16 @@ class SteeringController:
         if item["code"] != 0:
             return False
         # Some responses omit property identifiers; reject contradictory ones.
-        return (
+        acknowledged = (
             ("siid" not in item or type(item["siid"]) is int and item["siid"] == 4)
             and ("piid" not in item or type(item["piid"]) is int and item["piid"] == 15)
             and ("did" not in item or str(item["did"]) == did)
         )
+        if is_stop and acknowledged:
+            self._report_timing('stop_acknowledged_ms')
+        elif is_start and acknowledged:
+            self._report_timing('start_acknowledged_ms')
+        return acknowledged
 
     def _wait_until(self, deadline):
         """Wait only for the remaining client deadline; return cancellation."""
@@ -164,6 +188,7 @@ class SteeringController:
         Holds above one second may repeat once at the native one-second cadence,
         only after the first acknowledgement and before the original deadline.
         """
+        self._start_timing_sent = False
         if type(direction) is not str or direction not in (*_PRESETS, "stop"):
             raise SteeringError("Direction must be forward, left, right, or stop.")
         if type(duration_ms) is not int or not 100 <= duration_ms <= 1250:
@@ -269,6 +294,7 @@ class SteeringController:
         serialized, with no retry after an unknown acknowledgement. A normal
         release is successful once the final zero command is acknowledged.
         """
+        self._start_timing_sent = False
         if type(direction) is not str or direction not in _PRESETS:
             raise SteeringError("Hold direction must be forward, left, or right.")
         if type(max_duration_ms) is not int or not 100 <= max_duration_ms <= 5000:
