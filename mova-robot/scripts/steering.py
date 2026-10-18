@@ -97,9 +97,13 @@ class SteeringController:
             raise SteeringError(
                 "Child lock is enabled or unknown; no movement sent."
             )
-        if state["lds_state"] != 1:
+        # MOVAhome permits lowered LDS (0) while idle or remotely controlled;
+        # its lowered-LDS restriction applies to an existing cleaning task.
+        # The checks above already exclude such tasks. Unknown LDS values do
+        # not establish readiness, even when all other readings are safe.
+        if state["lds_state"] not in (0, 1):
             raise SteeringError(
-                "Raised navigation sensor is not confirmed; no movement sent."
+                "Navigation sensor state is unknown; no movement sent."
             )
 
     def _send(self, preset, *, audio):

@@ -34,6 +34,8 @@ Video uses MOVA `getAuthCodeV3`, Aliyun `loginbyoauth` and `createSessionByAuthC
 
 The video movement presets are forward `(200,0)`, left `(0,45)`, right `(0,-45)`, and stop `(0,0)`. The native lower-arrow preset `(0,180)` is a turn and is intentionally omitted. The unit scales and firmware deadman behavior are unverified. The CLI accepts 100–750 ms requested durations; this is a client deadline, **not a guarantee of movement duration**. Failed/slow network calls can delay stop. Use only under direct supervision and do not expose steering through the MCP bridge.
 
+Navigation sensor property 28.4 is 0 when lowered and 1 when raised. The native RemoteView blocks lowered-sensor control only during a cleaning/task workflow outside remote control; it permits idle manual movement. Our stricter idle/no-task gates therefore accept either known sensor value, while rejecting missing, noninteger or other values. No automatic sensor-height change is sent.
+
 ## Research provenance
 
 Static inspection used REA 6.4.0 and JADX backend 0.7.1 on MOVAhome 1.6.7.609 (`com.dreame.movahome`). Base APK SHA-256: `b259536764f20f97a5ea2d89159086becebcc5d5467222ad942ad1e7fe927d09`.

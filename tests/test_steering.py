@@ -85,7 +85,7 @@ class SteeringTests(unittest.TestCase):
             "state": [1, 3, 4, 6, 7, 999], "activity": [1, 13, 999],
             "error": [1, -1], "battery_percent": [14, 101], "charging": [0, 1, 3],
             "task_status": [1], "wash_station": [1], "child_lock": [1],
-            "dust_status": [1], "water_draining": [1], "lds_state": [0, 2],
+            "dust_status": [1], "water_draining": [1], "lds_state": [-1, 2, 999],
         }
         for field, values in unsafe.items():
             for value in values:
@@ -141,6 +141,36 @@ class SteeringTests(unittest.TestCase):
         self.assertEqual(result["requested_duration_ms"], 0)
         self.assertIsNone(result["start_acknowledged"])
         self.assertTrue(result["stop_acknowledged"])
+
+    def test_lowered_sensor_allows_idle_or_remote_without_existing_task(self):
+        # Recovered MOVAhome rule permits lowered LDS when no cleaning task is
+        # active, including the observed standby state 2 / activity 17.
+        for state, activity in ((2, 0), (2, 17), (23, 13)):
+            self.cloud.send.reset_mock()
+            self.robot.read.return_value = {
+                **READY, "state": state, "activity": activity, "lds_state": 0,
+            }
+            with self.subTest(state=state, activity=activity):
+                result = self.controller.move("forward", 100)
+                self.assertTrue(result["start_acknowledged"])
+                self.assertTrue(result["stop_acknowledged"])
+                self.assertEqual(
+                    [(p["spdv"], p["spdw"]) for p in self.packets()],
+                    [(200, 0), (0, 0)],
+                )
+
+    def test_lowered_sensor_does_not_permit_cleaning_or_existing_task(self):
+        cases = (
+            {"state": 2, "activity": 17, "task_status": 1},
+            {"state": 23, "activity": 13, "task_status": 1},
+            {"state": 1, "activity": 2, "task_status": 1},
+            {"state": 2, "activity": 2, "task_status": 0},
+        )
+        for status in cases:
+            self.robot.read.return_value = {**READY, **status, "lds_state": 0}
+            with self.subTest(status=status), self.assertRaises(SteeringError):
+                self.controller.move("forward", 100)
+        self.assert_no_commands()
 
     def test_cancel_during_readiness_prevents_any_nonzero_command(self):
         cancel = threading.Event()
