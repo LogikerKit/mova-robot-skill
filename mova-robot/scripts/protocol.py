@@ -63,7 +63,7 @@ class DreameVacuumDreameHomeCloudProtocol:
             if self._secondary_key:
                 data = f'{self._strings[12]}{self._strings[13]}{self._secondary_key}'
             else:
-                data = f'{self._strings[12]}{self._strings[14]}{self._username}{self._strings[15]}{hashlib.md5((self._password + self._strings[2]).encode('utf-8')).hexdigest()}{self._strings[16]}'
+                data = f"{self._strings[12]}{self._strings[14]}{self._username}{self._strings[15]}{hashlib.md5((self._password + self._strings[2]).encode('utf-8')).hexdigest()}{self._strings[16]}"
             headers = {'Accept': '*/*', 'Content-Type': 'application/x-www-form-urlencoded', 'Accept-Language': 'en-US;q=0.8', 'Accept-Encoding': 'gzip, deflate', self._strings[47]: self._strings[3], self._strings[49]: self._strings[5], self._strings[50]: self._ti if self._ti else self._strings[6]}
             if self._country == 'cn':
                 headers[self._strings[48]] = self._strings[4]
@@ -153,7 +153,7 @@ class DreameVacuumDreameHomeCloudProtocol:
         assert method in {'get_properties', 'set_properties', 'action'}
         host = ''
         if self._host and len(self._host):
-            host = f'-{self._host.split('.')[0]}'
+            host = f"-{self._host.split('.')[0]}"
         api_response = self._api_call(f'{self._strings[37]}{host}/{self._strings[27]}/{self._strings[38]}', {'did': str(self._did), 'id': self._id, 'data': {'did': str(self._did), 'id': self._id, 'method': method, 'params': parameters}}, retry_count)
         self._id = self._id + 1
         if api_response is None or 'data' not in api_response or api_response['data'] is None or ('result' not in api_response['data']):

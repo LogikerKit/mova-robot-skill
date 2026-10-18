@@ -8,7 +8,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import signal
 import struct
+import sys
 import tempfile
 import time
 import zlib
@@ -129,7 +131,14 @@ class Robot:
         if self.read({'mode':(4,23)})['mode'] != mode: raise RuntimeError('Mop-only mode not confirmed; no start sent')
         self.action(4,1,[{'piid':1,'value':18},{'piid':10,'value':json.dumps({'selects':[[room,1,1,1,1]]},separators=(',',':'))}])
         time.sleep(3)
-        after=self.status()
+        try:
+            after=self.status()
+        except Exception:
+            try:
+                self.action(2,2)
+            except Exception:
+                raise RuntimeError('Could not verify cleaning after start; pause also unconfirmed. Check the robot in MOVAhome before any retry. CleanGenius remains off.') from None
+            raise RuntimeError('Could not verify cleaning after start. Pause acknowledged; check status before any retry. CleanGenius remains off.') from None
         if after['mode'] & 3 != 1 or after['error'] != 0:
             self.action(2,2)
             raise RuntimeError('Unexpected mode/error after start. Pause acknowledged; verify status. CleanGenius remains off.')
@@ -139,20 +148,29 @@ class Robot:
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=['login','devices','status','rooms','pause','stop','mop'])
+    parser.add_argument('command',choices=['login','devices','status','rooms','pause','stop','mop','steer'])
     parser.add_argument('--device',help='Explicit device ID when account has several robots')
     parser.add_argument('--room',type=int)
     parser.add_argument('--execute',action='store_true',help='User has authorized this robot action')
     parser.add_argument('--replace-task',action='store_true')
+    parser.add_argument('--direction',choices=['forward','left','right','stop'])
+    parser.add_argument('--duration-ms',type=int,default=250,help='Requested steering pulse, 100–750 ms; cloud latency can prolong movement')
+    parser.add_argument('--experimental-steering',action='store_true',help='Enable supervised steering; firmware automatic-stop behaviour is unverified')
     args=parser.parse_args()
-    if args.command in {'pause','stop','mop'} and not args.execute:
+    if args.command in {'pause','stop','mop','steer'} and not args.execute:
         parser.error('Robot actions require an authorized request and --execute')
     if args.command=='mop' and args.room is None: parser.error('mop requires --room from the current map')
+    if args.command=='steer':
+        if not args.experimental_steering or args.direction is None:
+            parser.error('steer requires --experimental-steering and --direction for supervised operation')
+        if not 100 <= args.duration_ms <= 750:
+            parser.error('Requested steering duration must be 100–750 ms')
     logging.disable(logging.CRITICAL) # Upstream logs can contain auth responses.
     CONFIG.mkdir(parents=True,exist_ok=True,mode=0o700)
     with (CONFIG/'session.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         cloud=None
+        saved_refresh=None
         try:
             if args.command=='login':
                 region=input('MOVAhome region [eu]: ').strip() or 'eu'
@@ -167,6 +185,7 @@ def main():
                 cloud=DreameVacuumDreameHomeCloudProtocol(None,None,'mova',region,auth_key=session['refresh_token'])
             if not cloud.login(): raise RuntimeError('Login failed; sign in privately using login')
             save_session({'region':region,'refresh_token':cloud._secondary_key})
+            saved_refresh=cloud._secondary_key
             cloud._password=None
             data=cloud.get_devices()
             records=data['page']['records']
@@ -181,12 +200,36 @@ def main():
             if args.command=='status': output=robot.status()
             elif args.command=='rooms': output=robot.rooms()
             elif args.command=='mop': output=robot.mop(args.room,args.replace_task)
-            else:
+            elif args.command=='steer':
+                from steering import SteeringController
+                def cancel_steering(signum,frame):
+                    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+                    raise KeyboardInterrupt
+                previous=signal.signal(signal.SIGTERM,cancel_steering)
+                try:
+                    output=SteeringController(robot).move(args.direction,args.duration_ms)
+                finally:
+                    signal.signal(signal.SIGTERM,previous)
+            elif args.command in {'pause','stop'}:
                 robot.action(2,2) if args.command=='pause' else robot.action(4,2)
                 time.sleep(2);output={'action_acknowledged':args.command,'status':robot.status()}
+            else:
+                raise RuntimeError('Unsupported robot command')
             print(json.dumps(output,ensure_ascii=False))
         finally:
-            if cloud: cloud._session.close()
+            if cloud:
+                pending_error=sys.exc_info()[0] is not None
+                try:
+                    # The protocol can rotate tokens while handling expiry/401.
+                    # Persist that rotation before releasing the account lock.
+                    if cloud._logged_in and cloud._secondary_key and cloud._secondary_key != saved_refresh:
+                        try:
+                            save_session({'region':region,'refresh_token':cloud._secondary_key})
+                        except OSError:
+                            if not pending_error:
+                                raise RuntimeError('Session update failed. Sign in privately again; read status before retrying any action.') from None
+                finally:
+                    cloud._session.close()
 
 if __name__=='__main__':
     try: main()

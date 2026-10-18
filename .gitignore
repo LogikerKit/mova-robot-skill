@@ -6,3 +6,11 @@ session.json
 devices.json
 *map*.json
 *receipt*.json
+.tunnel/
+*.log
+video-app.json
+*video-session*.json
+*.apk
+*.xapk
+*.mp4
+*.flv
