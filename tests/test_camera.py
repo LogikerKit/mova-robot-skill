@@ -274,6 +274,70 @@ class CameraTests(unittest.TestCase):
         self.assertEqual(self.operations()[-1][2]["operation"], "end")
         self.assertTrue(self.session.camera_stop_acknowledged)
 
+    def test_live_session_and_stream_worker_share_five_minute_limit(self):
+        self.cloud.send.side_effect = self.successful_ack
+        now = [100.0]
+        written = []
+        node = Mock()
+        node.stdin = Mock()
+        node.stdin.write.side_effect = lambda value: written.append(json.loads(value))
+        node.stdout = io.BytesIO()
+        node.poll.return_value = None
+        decoder = Mock()
+        decoder.stdin = node.stdout
+        decoder.stdout = io.BytesIO()
+        decoder.poll.return_value = None
+        checkpoints = []
+        def wait(_):
+            now[0] += 1
+            # Model a visible client receiving fresh frames and polling status.
+            self.session.frame = b'fake-jpeg'
+            self.session.frame_at = now[0]
+            self.session.status(touch=True)
+            if now[0] in (161, 399):
+                checkpoints.append(self.session.status())
+            return False
+        with patch.object(camera.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(self.session, '_authenticate', return_value=self.identity), \
+                patch.object(camera.subprocess, 'Popen', side_effect=[node, decoder]), \
+                patch.object(camera.threading, 'Thread'), \
+                patch.object(self.session.cancel, 'wait', side_effect=wait):
+            self.session.last_client = now[0]
+            self.session._run('1234')
+        self.assertEqual(camera.CAMERA_SESSION_SECONDS, 300)
+        self.assertEqual(written[0]['maxDurationMs'], 300000)
+        self.assertEqual([state['phase'] for state in checkpoints], ['live', 'live'])
+        self.assertEqual([state['remaining_seconds'] for state in checkpoints], [239, 1])
+        self.assertTrue(all(state['close_reason'] is None for state in checkpoints))
+        self.assertEqual(now[0], 400)
+        self.assertEqual(self.session.phase, 'closed')
+        self.assertEqual(self.session.status()['close_reason'], 'timeout')
+        self.assertTrue(self.session.camera_stop_acknowledged)
+        self.assertTrue(self.session.cancel.is_set())
+        self.assertTrue(self.session.motion_cancel.is_set())
+        self.assertIsNone(self.session.frame)
+        self.assertEqual([op[2].get('operation') for op in self.operations()
+                          if op[2].get('operation')], ['start', 'end'])
+        self.assertTrue(all(call.args[2] == 0 for call in self.cloud.send.call_args_list))
+
+    def test_viewer_disconnect_limit_remains_fifteen_seconds(self):
+        with patch.object(camera.time, 'monotonic', return_value=100.0):
+            self.session.last_client = 85.0
+            self.session._check_cancel()
+            self.session.last_client = 84.99
+            with self.assertRaisesRegex(camera.CameraError, 'Viewer disconnected'):
+                self.session._check_cancel()
+        self.assertEqual(self.session.status()['close_reason'], 'disconnected')
+        self.assertTrue(self.session.motion_cancel.is_set())
+
+    def test_manual_close_reason_resets_only_for_new_camera_session(self):
+        self.session.stop()
+        self.session.stop('timeout')
+        self.assertEqual(self.session.status()['close_reason'], 'user')
+        with patch.object(camera.threading, 'Thread'):
+            self.session.start('1234')
+        self.assertIsNone(self.session.status()['close_reason'])
+
     def test_cloud_lock_released_and_rotated_token_saved_on_exception(self):
         access = camera.CloudAccess("123")
         access.cloud = self.cloud

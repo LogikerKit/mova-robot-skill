@@ -24,6 +24,7 @@ from steering import SteeringController, SteeringError
 logging.getLogger('protocol').disabled = True
 
 HERE = Path(__file__).resolve().parent
+CAMERA_SESSION_SECONDS = 300
 
 
 class CameraError(RuntimeError):
@@ -157,7 +158,8 @@ class CameraSession:
         self._pending_stops = 0
         self.worker = None
         self.phase = 'ready'
-        self.message = 'Enter your MOVAhome camera PIN to open a 60-second live view.'
+        self.message = 'Enter your MOVAhome camera PIN to open a five-minute live view.'
+        self.close_reason = None
         self.frame = None
         self.frame_at = 0.0
         self.last_client = time.monotonic()
@@ -179,6 +181,7 @@ class CameraSession:
                 'remaining_seconds':max(0, int(self.deadline-time.monotonic())) if self.deadline else 0,
                 'steering_allowed':self.allow_steering and not self.steering_disabled,
                 'steering_active':self.steer_lock.locked(),
+                'close_reason':self.close_reason,
                 'camera_stop_acknowledged':self.camera_stop_acknowledged}
 
     def _state(self, phase, message):
@@ -196,6 +199,7 @@ class CameraSession:
             self.cancel.clear()
             self.frame, self.frame_at = None, 0.0
             self.camera_stop_acknowledged = None
+            self.close_reason = None
             self.last_client = time.monotonic()
             self.deadline = 0.0
             self._steering_controller = None
@@ -203,8 +207,10 @@ class CameraSession:
             self.worker = threading.Thread(target=self._run,args=(pin,),daemon=False)
             self.worker.start()
 
-    def stop(self):
+    def stop(self, reason='user'):
         with self.lock:
+            if self.close_reason is None:
+                self.close_reason = reason
             self.cancel.set()
             self.motion_cancel.set()
             self.motion_generation += 1
@@ -215,6 +221,7 @@ class CameraSession:
         if self.cancel.is_set():
             raise CameraError('Camera opening cancelled.')
         if time.monotonic()-self.last_client > 15:
+            self.stop('disconnected')
             raise CameraError('Viewer disconnected; camera session ended.')
 
     def _authenticate(self, payload):
@@ -251,7 +258,7 @@ class CameraSession:
             if not chunk:break
             buffer.extend(chunk)
             if len(buffer)>4_000_000:
-                self.stop()
+                self.stop('error')
                 break
             while True:
                 begin = buffer.find(b'\xff\xd8')
@@ -320,11 +327,12 @@ class CameraSession:
                 action(c,session,1,1,{'operType':'monitor','operation':'start',
                     'token':'alify','channelId':iot_id,'area':'4'})
             self._check_cancel()
-            self.deadline = time.monotonic()+60
+            self.deadline = time.monotonic()+CAMERA_SESSION_SECONDS
             node = subprocess.Popen(['node',str(HERE/'video_worker.mjs'),'stream'],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
             processes.append(node)
-            node.stdin.write(json.dumps({'identity':identity,'credentials':credentials,'iotId':iot_id}).encode())
+            node.stdin.write(json.dumps({'identity':identity,'credentials':credentials,'iotId':iot_id,
+                'maxDurationMs':CAMERA_SESSION_SECONDS*1000}).encode())
             node.stdin.close()
             decoder = subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','error','-nostdin',
                 '-fflags','nobuffer','-flags','low_delay','-f','flv','-i','pipe:0','-an',
@@ -344,7 +352,7 @@ class CameraSession:
                 if now-(self.frame_at or started)>25:
                     raise CameraError('No recent video frames arrived. The camera is being closed.')
                 if self.frame_at:
-                    self._state('live','Live view · closes automatically after 60 seconds')
+                    self._state('live','Live view · closes automatically after five minutes')
                 if now-keepalive>=8:
                     with self.access.transaction() as c:
                         action(c,session,1,6,{'operType':'keep_alive',
@@ -356,7 +364,8 @@ class CameraSession:
             failure = 'Camera connection failed; private details omitted. Check MOVAhome before retrying.'
         finally:
             pin = None
-            self.stop()
+            self.stop('error' if failure else 'timeout' if self.deadline and
+                time.monotonic()>=self.deadline else 'user')
             for p in reversed(processes):
                 try:
                     if p.poll() is None:p.terminate()
@@ -379,12 +388,15 @@ class CameraSession:
                     self.camera_stop_acknowledged = True
                 except Exception:
                     self.camera_stop_acknowledged = False
+                    self.close_reason = 'error'
                     failure = 'Camera close was not confirmed. Close live video in MOVAhome now.'
             with self.lock:
                 self.frame = None
                 self.frame_at = 0.0
                 self.deadline = 0.0
-                self._state('error' if failure else 'closed', failure or 'Camera close acknowledged. No video was saved.')
+                closed_message = ('Five-minute live view ended. Camera close acknowledged. No video was saved.'
+                    if self.close_reason == 'timeout' else 'Camera close acknowledged. No video was saved.')
+                self._state('error' if failure else 'closed', failure or closed_message)
 
     def steer(self, direction, supervised=False):
         if direction != 'stop':

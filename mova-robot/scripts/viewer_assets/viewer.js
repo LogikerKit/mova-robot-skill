@@ -56,7 +56,12 @@ function prerequisite(){
   if(!state)return 'Connecting to the viewer…';
   if(state.phase==='starting'||opening)return 'Wait for the live picture to appear.';
   if(state.phase==='stopping')return 'Wait for the camera to close, then open live view again.';
-  if(state.phase!=='live')return 'Open live view above to enable movement.';
+  if(state.phase!=='live'){
+    if(state.close_reason==='timeout')return 'This five-minute camera session ended. Reopen live view to continue.';
+    if(state.close_reason==='disconnected')return 'The camera closed after losing its connection. Reopen live view to continue.';
+    if(state.phase==='closed'||state.phase==='error')return 'The camera is closed. Reopen live view to continue.';
+    return 'Open live view to enable movement.';
+  }
   if(!state.steering_allowed)return 'Movement is unavailable in this viewer. Check MOVAhome, then restart the viewer with steering enabled.';
   if(!$('supervised').checked)return 'Tick the box to confirm you can see the robot in person and keep its path clear.';
   if(!freshPicture())return 'Waiting for a fresh picture. Movement stays off until it appears.';
@@ -75,6 +80,8 @@ function refreshButtons(){
   const running=['starting','live','stopping'].includes(state?.phase);
   $('open').disabled=opening||running||!token;$('pin').disabled=opening||running||!token;
   $('close').disabled=!token||(!running&&!opening);
+  $('reconnect').hidden=!token||!state||running||opening;
+  $('reconnect').textContent=state?.phase==='ready'?'Open live view':'Reopen live view';
   $('steerhint').textContent=reason||(activeHold?.held?'Keep holding to move. Release to stop.':
     activeHold||stopBusy?'Waiting for the stop confirmation…':'Press and hold a direction. Release to stop.');
 }
@@ -150,7 +157,11 @@ function startHold(button,input){
     generation:++steeringGeneration,...input};
   activeHold=hold;
   if(hold.pointerId!==undefined){
-    try{button.setPointerCapture(hold.pointerId);}catch{activeHold=null;refreshButtons();return;}
+    try{button.setPointerCapture(hold.pointerId);}catch{
+      activeHold=null;
+      $('steerstatus').textContent='This press could not be held. Release and try again, or hold Space or Enter on a direction.';
+      refreshButtons();return;
+    }
   }
   hold.heartbeatTimer=setInterval(()=>heartbeat(hold),250);
   hold.limitTimer=setTimeout(()=>releaseHold('Five-second limit reached. Waiting for stop confirmation…'),MAX_HOLD_MS);
@@ -182,6 +193,10 @@ document.querySelectorAll('[data-direction]').forEach(button=>{
 window.addEventListener('pointerup',releasePointer);window.addEventListener('pointercancel',releasePointer);
 window.addEventListener('keyup',releaseKey);window.addEventListener('blur',()=>releaseHold());
 $('supervised').onchange=()=>{if(!$('supervised').checked)releaseHold();refreshButtons();};
+$('reconnect').onclick=()=>{
+  if($('reconnect').hidden)return;
+  $('open').scrollIntoView({behavior:'smooth',block:'center'});$('pin').focus();
+};
 document.querySelector('[data-direction="stop"]').onclick=async()=>{
   if(stopBusy||!token)return;
   releaseHold();stopBusy=true;const generation=++steeringGeneration;
@@ -209,10 +224,10 @@ $('close').onclick=async()=>{
   try{await call('/stop',{});await poll();}catch(error){$('status').textContent=error.message;}
 };
 async function poll(){
-  if(!token||document.hidden||pollBusy)return;
+  if(!token||pollBusy)return;
   pollBusy=true;const generation=stateGeneration;
   try{
-    const next=await call('/status');if(!token||document.hidden||generation!==stateGeneration)return;
+    const next=await call('/status');if(!token||generation!==stateGeneration)return;
     state=next;stateAt=performance.now();$('status').textContent=state.message;$('dot').className=state.phase;
     $('countdown').textContent=state.remaining_seconds?`${state.remaining_seconds}s`:'';
     if(!serverPictureFresh()){
@@ -221,7 +236,7 @@ async function poll(){
     }
     guardHold();refreshButtons();
   }catch(error){
-    if(!token||document.hidden||generation!==stateGeneration)return;
+    if(!token||generation!==stateGeneration)return;
     state=null;releaseHold('Viewer connection lost. Waiting for stop confirmation…');clearPicture();
     $('status').textContent='Viewer connection lost. Check MOVAhome to confirm the camera is closed.';
     $('empty').textContent='Viewer disconnected.';$('countdown').textContent='';$('dot').className='error';
@@ -234,13 +249,16 @@ async function frame(){
   const now=performance.now();const expires=now+2000-(state.frame_age_ms+now-stateAt);
   let next=null,timer=null;
   try{
-    const response=await fetch('/frame',{headers:headers(),cache:'no-store',signal:request.signal});
+    const timeout=new Promise((_,reject)=>{
+      timer=setTimeout(()=>{request.abort();reject(Error('Picture timed out'));},2000);
+    });
+    const response=await Promise.race([fetch('/frame',{headers:headers(),cache:'no-store',signal:request.signal}),timeout]);
     if(response.status===403){expireAccess();return;}
     if(response.status!==200)throw Error('No picture');
-    const blob=await response.blob();
+    const blob=await Promise.race([response.blob(),timeout]);
     if(generation!==frameGeneration||!serverPictureFresh()||performance.now()>=expires)return;
     next=URL.createObjectURL(blob);const decoded=new Image();decoded.src=next;
-    await Promise.race([decoded.decode(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Picture timed out')),2000);})]);
+    await Promise.race([decoded.decode(),timeout]);
     if(generation!==frameGeneration||!serverPictureFresh()||performance.now()>=expires)return;
     const old=frameUrl;frameUrl=next;next=null;$('picture').src=frameUrl;$('picture').hidden=false;
     displayedUntil=expires;$('empty').hidden=true;$('livebadge').hidden=false;
@@ -261,7 +279,17 @@ function closeOnLeave(){
   if(token)call('/stop',{}, {keepalive:true}).catch(()=>{});
 }
 window.addEventListener('pagehide',closeOnLeave);
-document.addEventListener('visibilitychange',()=>{if(document.hidden)closeOnLeave();else poll();});
+document.addEventListener('visibilitychange',()=>{
+  stateGeneration++;
+  if(document.hidden){
+    releaseHold('Movement released while you switch away. Waiting for stop confirmation…');
+    clearPicture();refreshButtons();poll();
+  }else{
+    // A status heartbeat keeps an existing camera session alive while hidden;
+    // movement still needs a newly loaded picture when the person returns.
+    clearPicture();refreshButtons();poll().then(frame);
+  }
+});
 refreshButtons();
 if(!token)$('status').textContent=accessMessage();
 else poll();

@@ -22,6 +22,8 @@ class Element extends Target{
     this.checked=false;this.value='';this.textContent='';this.attributes={};this.captures=new Set();this.classes=new Set();
     this.classList={toggle:(name,on)=>on?this.classes.add(name):this.classes.delete(name)};}
   setAttribute(name,value){this.attributes[name]=value;}
+  focus(){this.focused=true;}
+  scrollIntoView(){this.scrolled=true;}
   removeAttribute(name){delete this[name];delete this.attributes[name];}
   setPointerCapture(id){this.captures.add(id);}
   hasPointerCapture(id){return this.captures.has(id);}
@@ -30,7 +32,7 @@ class Element extends Target{
 function browser({hash='#'+TOKEN,storage=new Map(),origin='http://127.0.0.1:54321',phase='live'}={}){
   let now=10000,nextTimer=1,random=0,nextBlob=0;
   const timers=new Map(),calls=[],pending=new Map(),routes=new Map();
-  const elements=Object.fromEntries(['picture','empty','livebadge','status','dot','countdown','open','close','pin','supervised','steerstatus','steerhint'].map(id=>[id,new Element(id)]));
+  const elements=Object.fromEntries(['picture','empty','livebadge','status','dot','countdown','open','close','pin','supervised','steerstatus','steerhint','reconnect'].map(id=>[id,new Element(id)]));
   elements.picture.hidden=true;
   const buttons=['left','forward','right','stop'].map(direction=>new Element(direction,direction));
   const document=new Target();document.hidden=false;document.getElementById=id=>elements[id];
@@ -107,7 +109,7 @@ test('a rejected start re-enables Open and PIN with a closed-camera prerequisite
 });
 
 test('prerequisites distinguish closed, starting, disabled, unsupervised and stale display',async()=>{
-  const b=browser({phase:'closed'});await flush();assert.match(b.elements.steerhint.textContent,/Open live view/);
+  const b=browser({phase:'closed'});await flush();assert.match(b.elements.steerhint.textContent,/camera is closed.*Reopen live view/);
   b.model.phase='starting';await b.run('poll()');assert.match(b.elements.steerhint.textContent,/Wait for the live picture/);
   b.model.phase='live';b.model.has_frame=true;b.model.steering_allowed=false;await b.run('poll()');
   assert.match(b.elements.steerhint.textContent,/Movement is unavailable.*restart the viewer with steering enabled/);
@@ -215,4 +217,71 @@ test('five-second frontend cap releases without another press or movement retry'
   assert.equal(b.count('/steer/hold').length,1);assert.equal(b.count('/steer/release').length,1);
   const heartbeats=b.count('/steer/heartbeat').length;await b.advance(1000);
   assert.equal(b.count('/steer/heartbeat').length,heartbeats);assert.equal(b.elements.supervised.checked,true);
+});
+
+test('hidden tabs keep only the viewer heartbeat, release movement, and require a new visible image',async()=>{
+  const b=browser();await b.ready();b.buttons[0].dispatch('pointerdown');await flush();
+  const frames=b.count('/frame').length,statusPolls=b.count('/status').length;
+  b.document.hidden=true;b.document.dispatch('visibilitychange');await flush();
+  assert.equal(b.count('/steer/release').length,1);assert.equal(b.count('/stop').length,0);
+  assert.equal(b.elements.picture.hidden,true);assert.equal(b.buttons[0].disabled,true);
+  await b.advance(4500);
+  assert.ok(b.count('/status').length>statusPolls+2);
+  assert.equal(b.count('/frame').length,frames);assert.equal(b.count('/steer/heartbeat').length,0);
+  const decode=deferred();b.setDecode(()=>decode.promise);
+  b.document.hidden=false;b.document.dispatch('visibilitychange');await flush();
+  assert.equal(b.elements.picture.hidden,true);assert.equal(b.buttons[0].disabled,true);
+  decode.resolve();await flush();
+  assert.equal(b.elements.picture.hidden,false);assert.equal(b.buttons[0].disabled,false);
+  assert.equal(b.elements.supervised.checked,true);assert.equal(b.count('/steer/hold').length,1);
+});
+
+test('a frame requested before hiding cannot restore the picture while hidden',async()=>{
+  const b=browser();await b.ready();const old=deferred();b.routes.set('/frame',()=>old.promise);
+  const request=b.run('frame()');await flush();b.document.hidden=true;b.document.dispatch('visibilitychange');
+  old.resolve(response());await request;await flush();
+  assert.equal(b.elements.picture.hidden,true);assert.equal(b.buttons[0].disabled,true);
+  assert.equal(b.count('/stop').length,0);
+});
+
+test('manual close and actual page exit still close the camera',async()=>{
+  for(const event of ['manual','pagehide']){
+    const b=browser();await b.ready();b.buttons[0].dispatch('pointerdown');await flush();
+    if(event==='manual')b.elements.close.dispatch('click');else b.window.dispatch('pagehide');
+    await flush();
+    assert.equal(b.count('/steer/release').length,1,event);assert.equal(b.count('/stop').length,1,event);
+    assert.equal(b.elements.picture.hidden,true,event);assert.equal(b.elements.supervised.checked,false,event);
+  }
+});
+
+test('an expired camera has a prominent reopen action that only focuses the PIN controls',async()=>{
+  const b=browser({phase:'closed'});await flush();b.model.close_reason='timeout';await b.run('poll()');
+  assert.match(b.elements.steerhint.textContent,/five-minute camera session ended/);
+  assert.equal(b.elements.reconnect.hidden,false);assert.equal(b.elements.reconnect.textContent,'Reopen live view');
+  b.elements.reconnect.dispatch('click');
+  assert.equal(b.elements.pin.focused,true);assert.equal(b.elements.open.scrolled,true);
+  assert.equal(b.count('/start').length,0);assert.equal(b.storage.size,1);
+  b.model.phase='ready';b.model.close_reason=null;await b.run('poll()');
+  assert.match(b.elements.steerhint.textContent,/Open live view to enable/);
+  assert.equal(b.elements.reconnect.textContent,'Open live view');
+  b.model.phase='live';b.model.has_frame=true;await b.run('poll()');assert.equal(b.elements.reconnect.hidden,true);
+});
+
+test('a hung frame fetch times out and a later frame can restore controls',async()=>{
+  const b=browser();await b.ready();const hung=deferred();b.routes.set('/frame',()=>hung.promise);
+  const request=b.run('frame()');await flush();const options=b.count('/frame').at(-1).options;
+  await b.advance(2000);await request;
+  assert.equal(options.signal.aborted,true);assert.equal(b.elements.picture.hidden,true);
+  assert.equal(b.buttons[0].disabled,true);
+  b.routes.delete('/frame');await b.advance(250);
+  assert.equal(b.elements.picture.hidden,false);assert.equal(b.buttons[0].disabled,false);
+  assert.equal(b.count('/steer/hold').length,0);
+});
+
+test('pointer capture failure explains the failed press without sending movement',async()=>{
+  const b=browser();await b.ready();b.buttons[0].setPointerCapture=()=>{throw Error('not captured');};
+  b.buttons[0].dispatch('pointerdown');await flush();
+  assert.match(b.elements.steerstatus.textContent,/press could not be held.*Space or Enter/);
+  assert.equal(b.count('/steer/hold').length,0);assert.equal(b.buttons[0].disabled,false);
+  await b.advance(500);assert.equal(b.count('/steer/heartbeat').length,0);
 });
