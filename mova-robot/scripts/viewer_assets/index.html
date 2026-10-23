@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MOVA · Private live view</title><link rel="stylesheet" href="/viewer.css"><script src="/viewer.js" defer></script></head>
+<body><main><header><span class="brand">MOVA / LOCAL VIEWER</span><span class="tag">Experimental</span></header>
+<h1>A look from your robot.</h1><p class="intro">A private live view on this computer. Nothing is recorded.</p>
+<section class="camera" aria-label="Robot camera"><img id="picture" alt="Live picture from your MOVA robot" hidden><div id="empty">Your camera is off.</div><span id="livebadge" hidden>LIVE</span></section>
+<div class="statusline"><span id="dot"></span><p id="status" role="status">Enter the camera PIN you already use in MOVAhome.</p><span id="countdown"></span></div>
+<section class="controls"><div><label for="pin">Camera PIN</label><div class="inputrow"><input id="pin" type="password" inputmode="numeric" autocomplete="off" maxlength="16" placeholder="Enter privately"><button id="open">Open live view</button></div>
+<p class="hint">The PIN is used for this session only. Live view stays open for up to five minutes when you switch tabs. Close the camera or this page to end it sooner.</p></div><button id="close" class="secondary">Close camera</button></section>
+<section class="steering"><h2>Press and hold to move</h2><p>Release or switch away to stop movement. Each hold ends after five seconds. Video and stopping can be delayed; watch the robot directly.</p>
+<label class="check"><input type="checkbox" id="supervised"> I can see the robot in person and keep its path clear.</label>
+<p class="hint" id="steerhint" role="status">Open live view above to enable movement.</p>
+<button id="reconnect" class="secondary reconnect" hidden>Open live view</button>
+<div class="directions" aria-describedby="steerhint"><button data-direction="left" disabled>↶ Left</button><button data-direction="forward" disabled>↑ Forward</button><button data-direction="right" disabled>Right ↷</button><button data-direction="stop" class="stop">Stop movement</button></div>
+<p class="hint" id="steerstatus" role="status">On a keyboard, hold Space or Enter on a direction. Keep MOVAhome available to stop the robot.</p><p class="hint" id="steertiming" role="status"></p></section>
+<footer>Uses your existing MOVA login. The PIN stays in memory. Native video encryption is required; the relay does not use TLS. This page is available only on this computer.</footer>
+</main></body></html>

@@ -1,6 +1,6 @@
 ---
 name: mova-robot
-description: Read MOVAhome robot status and room maps, pause or stop a robot, and run verified room-only mopping on a MOVA Z60 using a private local cloud session. Use for the user's MOVA robot; spill-mode detection is supported but spill-mode activation is not.
+description: Read MOVAhome robot status and rooms, pause or stop, mop a selected room, or open a private local MOVA Z60 camera viewer with experimental supervised steering. Spill-mode detection is supported but spill-mode activation is not.
 ---
 
 # MOVA robot
@@ -28,3 +28,13 @@ Only run mutations for a user-requested action. Existing explicit requests suffi
 Read [references/protocol.md](references/protocol.md) for mappings and observed limitations. Task type 15 means water-stain cleaning; 16 means paused water-stain cleaning. The start command is NOT established. Never substitute ordinary low-water mopping for a requested spill/no-added-water mode. Explain this limit and let the user start it in MOVAhome, then verify `status`.
 
 Readbacks can lag. An acknowledgement alone is not proof of execution. Unknown error codes should be reported as unknown; user-visible app information may be needed. Keep task type, cleaning mode, current activity and water setting distinct. Do not claim water level 1 proves that no water is added or that every Z60 firmware uses the same UI scale.
+
+## Camera and supervised steering
+
+Read [references/video.md](references/video.md) before using these experimental features. Camera support currently covers the European MOVA Z60 using Aliyun. Requires Node.js 22+, ffmpeg, an existing MOVAhome camera PIN, and one-time extraction from the user's MOVAhome APK. Never request a PIN in chat, inspect a filled PIN field, pass it as a command-line argument, or store it. Never set/reset the PIN or switch video vendors.
+
+Run `python3 scripts/viewer.py --allow-steering` and open its private loopback link in the user's browser. Opening the page does not activate the camera. The user enters their PIN privately and clicks Open live view. The viewer requires native media encryption, attempts camera close after errors/cancellation, and limits each view to five minutes. Switching away requests movement stop and clears the displayed picture while retaining the existing camera session; returning requires a fresh picture before another hold. Closing the page or choosing Close camera ends the session. It saves no footage. Distinguish video-login success, a start acknowledgement, and actual received frames; only the latter verifies a working view.
+
+Steering is for a person with the robot in sight. For camera-assisted tests, inspect a fresh picture immediately before and after every movement; compare fixed scene landmarks and distinguish visible movement from acknowledgements. The viewer uses press-and-hold controls with a stop request on release, a five-second limit per hold, a one-second browser heartbeat lease, and acknowledged direction refreshes at the native one-second cadence. The CLI retains a 1250 ms bounded default. Cloud delay can prolong physical motion. Firmware automatic stopping has not been verified. Do not automate navigation, infer a clear path from delayed video, or claim a stop acknowledgement proves a physical stop. No reverse preset is exposed: the app's lower arrow rotates rather than reversing. An uncertain movement disables further viewer movement for that run; ordinary release permits the next deliberate hold. Stop remains available.
+
+For an explicit supervised CLI request, use `steer --direction forward|left|right|stop --duration-ms 1250 --experimental-steering --execute`. Nonzero motion requires an idle, undocked robot with no active task or fault, adequate battery, child lock off and a known navigation-sensor state (0 lowered or 1 raised). The native Z60 app permits lowered-sensor manual steering while idle; do not raise it automatically or accept unknown sensor readings. Do not end an existing cleaning task merely to enable steering. Never automatically retry movement after an unknown result. If stop is unconfirmed, tell the user to stop the robot in MOVAhome immediately. Camera and steering remain deliberately absent from the MCP bridge; do not expose raw commands or PINs as model tools.
