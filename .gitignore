@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 .env*
 session.json
+session.lock
+client-id
+.client-id-*
 devices.json
 *map*.json
 *receipt*.json
@@ -12,5 +15,10 @@ video-app.json
 *video-session*.json
 *.apk
 *.xapk
+*.dex
+*.so
+*.bundle
+*.jx
+*.zip
 *.mp4
 *.flv
